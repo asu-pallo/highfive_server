@@ -1,0 +1,80 @@
+# HighFive 서버 (Python / Django 전제)
+#
+# 기술 스택이 확정되면 맞지 않는 항목은 지운다. 지금은 열품타(pi_django) 구성을
+# 기준으로 잡아 두었다.
+
+# ─────────────────────────────────────────────
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 가상환경. 이름이 팀마다 달라 흔한 것들을 모두 막는다.
+venv/
+.venv/
+env/
+ENV/
+
+# 배포·패키징 산출물
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# ─────────────────────────────────────────────
+# ⚠️ 비밀값. 유출되면 서버와 사용자 데이터가 통째로 열린다.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+local_settings.py
+
+# Firebase 서비스 계정 키 (푸시·인증에 쓰는 관리자 권한 키)
+*serviceAccount*.json
+*firebase-adminsdk*.json
+
+# ─────────────────────────────────────────────
+# Django
+db.sqlite3
+db.sqlite3-journal
+
+# 사용자가 올린 파일. 저장소가 아니라 스토리지에 둔다.
+/media/
+
+# collectstatic 결과물. 원본은 각 앱의 static/ 에 있다.
+/staticfiles/
+/static_root/
+
+*.log
+
+# ─────────────────────────────────────────────
+# 테스트·커버리지
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ─────────────────────────────────────────────
+# 에디터·OS
+.DS_Store
+.idea/
+*.iml
+*.swp
+
+# .vscode 는 커밋한다. 팀이 공유하는 설정(포맷 끄기 등)이 들어 있다.
+.vscode/*
+!.vscode/settings.json
