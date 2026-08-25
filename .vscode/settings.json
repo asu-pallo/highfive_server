@@ -1,0 +1,10 @@
+{
+    "editor.fontSize": 12,
+    "editor.lineHeight": 1.6,
+    "terminal.integrated.fontFamily": "'JetBrains Mono', 'D2Coding'",
+    "terminal.integrated.fontSize": 14,
+    "window.zoomLevel": 0.64,
+    "debug.console.fontSize": 14,
+    "debug.console.fontFamily": "'JetBrains Mono', 'D2Coding'",
+    "claudeCode.useTerminal": true,
+}
