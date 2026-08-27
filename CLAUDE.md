@@ -22,10 +22,12 @@ API 스펙이나 데이터 형식이 궁금하면 **추측하지 말고 앱 코�
 
 ## 현재 상태
 
-**Django 골격만 있는 상태.** 도메인 앱(사용자·러닝·하이파이브)은 아직 없다.
+**사용자·인증까지 되어 있다.** 러닝 기록과 하이파이브 판정은 아직 없다.
 
-- git 저장소 아님 (유저가 직접 관리)
+- `user_manager` — Profile 모델 + 소셜/자동 로그인 + 닉네임 API. 테스트 36개
+- 러닝 기록 테이블 없음. 앱은 아직 건강 데이터를 **기기 안에서만** 다룬다
 - DB 는 개발용 SQLite. 운영 DB 는 미정
+- git 저장소다(앱과 별개). 커밋은 유저가 직접 관리한다
 
 ## 기술 스택
 
@@ -51,12 +53,28 @@ server/
 ├─ requirements.txt
 ├─ .env            # 커밋 안 됨
 ├─ .env.example    # 형식만 커밋
-└─ config/         # 프로젝트 설정 패키지 (열품타의 pi/ 에 해당)
-   ├─ settings.py
-   ├─ urls.py      # 앱이 부르는 엔드포인트는 전부 /api/ 아래
-   ├─ asgi.py
-   └─ wsgi.py
+├─ secrets/        # Firebase 서비스 계정 키. 커밋 안 됨
+├─ config/         # 프로젝트 설정 패키지 (열품타의 pi/ 에 해당)
+│  ├─ settings.py
+│  ├─ api.py       # DRF 예외를 {'s': false, 'msg': ...} 로 통일
+│  ├─ urls.py      # 앱이 부르는 엔드포인트는 전부 /api/ 아래
+│  ├─ asgi.py
+│  └─ wsgi.py
+└─ user_manager/   # 사용자·인증
+   ├─ models.py       Profile
+   ├─ views.py        signin · autologin · nickname
+   ├─ firebase.py     ID 토큰 검증
+   ├─ nickname.py     정규화·검증 규칙
+   └─ management/commands/runserver.py   # 아래 참고
 ```
+
+> **`runserver` 를 덮어썼다.** 기본이 `127.0.0.1` 이라 실기기가 못 붙고,
+> `runserver 0.0.0.0` 은 포트가 없다고 에러가 난다. 그래서 기본 주소를 `0.0.0.0` 으로
+> 바꾸고 주소만 줘도 포트를 붙이게 했다. `DEBUG=False` 면 `127.0.0.1` 로 되돌아간다.
+>
+> ⚠️ 이 때문에 **`INSTALLED_APPS` 에서 `user_manager` 가 맨 앞**에 있다. Django 는
+> 목록을 뒤에서부터 훑으며 관리 명령을 등록해서, 뒤에 두면 `staticfiles` 의 것이
+> 우리 걸 덮어쓴다.
 
 ## 실행
 
@@ -69,11 +87,14 @@ cp .env.example .env      # DJANGO_SECRET_KEY 를 채운다
 .venv/bin/python manage.py migrate
 ```
 
-개발 서버 (앱 실기기에서 붙으려면 `0.0.0.0` 이어야 한다):
+개발 서버. **기본이 `0.0.0.0:8000`** 이라 그냥 띄우면 실기기에서도 붙는다:
 
 ```bash
-.venv/bin/python manage.py runserver 0.0.0.0:8000
+.venv/bin/python manage.py runserver
 ```
+
+앱은 `app/lib/src/core/config/api_config.dart` 의 `_devUrl` 을 본다. 실기기로 테스트할
+때는 거기에 **맥의 LAN 주소**가 들어가 있어야 한다(와이파이가 바뀌면 달라진다).
 
 확인: `GET /api/health/` → `{"s": true}`
 
@@ -92,7 +113,6 @@ cp .env.example .env      # DJANGO_SECRET_KEY 를 채운다
 | `GET /api/health/` | 공개 | 헬스체크 |
 | `POST /api/auth/signin/` | 공개 | **소셜 로그인.** 가입을 겸한다 |
 | `POST /api/auth/autologin/` | 공개 | **자동 로그인.** refresh 토큰으로 세션을 잇는다 |
-| `GET /api/users/nickname/check/` | 인증 | 닉네임 중복 미리 확인 |
 | `POST /api/users/nickname/` | 인증 | 닉네임 설정·변경 |
 
 **로그인은 이 둘뿐이다. 별도의 회원가입 API 도, 기기 정보 API 도 없다.**
@@ -140,10 +160,24 @@ deviceType  deviceModel  osVersion  appVersion  timezone  fcmToken
 서비스 계정 키는 `secrets/` 에 두고 `.env` 의 `FIREBASE_CREDENTIALS` 로 경로를 준다.
 키가 없으면 `signin` 만 500 과 함께 안내 메시지를 낸다. 나머지 API 는 정상 동작한다.
 
+## Profile 컬럼
+
+```
+nickname  nicknameKey  loginProvider
+deviceType  deviceModel  osVersion  appVersion  timezone  fcmToken
+createdAt  lastLoginAt
+```
+
+테이블 이름은 Django 기본 규칙에 따라 `user_manager_profile` — 열품타와 같다.
+필드는 camelCase 로 맞췄다.
+
 ## 닉네임
 
 - `Profile.nickname` — 화면에 보이는 값
 - `Profile.nicknameKey` — 중복 판정용. **unique 는 여기에만** 건다
+- 앞뒤 공백을 제거한 뒤 **2~20자**만 허용한다
+- 한글 완성형·영문·숫자와 글자 사이 공백을 허용한다. 밑줄·이모지는 허용하지 않는다
+- 연속된 중간 공백은 한 칸으로 합쳐 공백 개수만 다른 중복 닉네임을 막는다
 
 키는 NFKC 정규화 + `casefold()` 다. `Runner` / `runner` / `ｒｕｎｎｅｒ` 가 모두 같은
 이름으로 취급된다. **정규화가 문자 검사보다 먼저** 돌아야 한다 — 순서가 바뀌면 전각

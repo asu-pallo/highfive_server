@@ -9,7 +9,6 @@ from .models import Profile
 SIGNIN = '/api/auth/signin/'
 AUTOLOGIN = '/api/auth/autologin/'
 NICKNAME = '/api/users/nickname/'
-NICKNAME_CHECK = '/api/users/nickname/check/'
 
 CLIENT = {
     'deviceType': 'ios',
@@ -134,7 +133,7 @@ class AutoLoginTest(APITestCase):
         res = self._login()
 
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {res.data["access"]}')
-        me = self.client.get(NICKNAME_CHECK, {'nickname': '이름테스트'})
+        me = self.client.post(NICKNAME, {'nickname': '이름테스트'})
         self.assertEqual(me.status_code, 200)
 
     def test_프로필도_함께_온다(self):
@@ -231,30 +230,47 @@ class NicknameTest(APITestCase):
         self.profile.refresh_from_db()
         self.assertEqual(self.profile.nickname, 'runner')
 
-    def test_이미_쓰는_닉네임은_409(self):
+    def test_가운데_공백은_거절한다(self):
+        """`달리는사람` 과 `달리는 사람` 이 나란히 존재하면 피드에서 구분할 수 없다."""
+        res = self.client.post(NICKNAME, {'nickname': '달리는 사람'})
+        self.assertEqual(res.status_code, 400)
+
+    def test_공백은_조용히_붙이지_않는다(self):
+        """가운데 공백을 없애 저장하면 사용자가 친 것과 다른 이름이 된다."""
+        self.client.post(NICKNAME, {'nickname': '달리는 사람'})
+        self.profile.refresh_from_db()
+        self.assertIsNone(self.profile.nickname)
+
+    def test_같은_닉네임을_여러_사람이_쓸_수_있다(self):
+        """표시용 이름이라 겹쳐도 된다. 사용자 식별은 user_id 가 한다."""
         self.other.nickname, self.other.nicknameKey = 'runner', 'runner'
         self.other.save()
 
         res = self.client.post(NICKNAME, {'nickname': 'runner'})
-        self.assertEqual(res.status_code, 409)
 
-    def test_대소문자만_달라도_막힌다(self):
-        self.other.nickname, self.other.nicknameKey = 'Runner', 'runner'
-        self.other.save()
+        self.assertEqual(res.status_code, 200)
+        self.profile.refresh_from_db()
+        self.assertEqual(self.profile.nickname, 'runner')
 
+    def test_대소문자가_달라도_그대로_저장한다(self):
+        """키는 소문자로 접지만 화면에 보이는 값은 친 그대로 남긴다."""
         res = self.client.post(NICKNAME, {'nickname': 'RUNNER'})
-        self.assertEqual(res.status_code, 409)
 
-    def test_전각_문자로_우회할_수_없다(self):
-        """정규화(NFKC)가 검사보다 먼저 돌아야 여기서 409 가 난다.
+        self.assertEqual(res.status_code, 200)
+        self.profile.refresh_from_db()
+        self.assertEqual(self.profile.nickname, 'RUNNER')
+        self.assertEqual(self.profile.nicknameKey, 'runner')
+
+    def test_전각_문자는_표준형으로_바뀐다(self):
+        """정규화(NFKC)가 검사보다 먼저 돌아야 통과한다.
 
         순서가 뒤바뀌면 '쓸 수 없는 문자'로 400 이 떨어져 안내가 엉뚱해진다.
         """
-        self.other.nickname, self.other.nicknameKey = 'runner', 'runner'
-        self.other.save()
-
         res = self.client.post(NICKNAME, {'nickname': 'ｒｕｎｎｅｒ'})
-        self.assertEqual(res.status_code, 409)
+
+        self.assertEqual(res.status_code, 200)
+        self.profile.refresh_from_db()
+        self.assertEqual(self.profile.nickname, 'runner')
 
     def test_자기_닉네임은_다시_저장해도_된다(self):
         self.client.post(NICKNAME, {'nickname': 'runner'})
@@ -262,12 +278,21 @@ class NicknameTest(APITestCase):
         self.assertEqual(res.status_code, 200)
 
     def test_규칙에_어긋나면_400(self):
-        cases = ['a', 'a' * 16, 'run ner', 'runner!', '🏃running', '관리자김',
-                 'highfive팀', '']
+        cases = ['a', 'a' * 13, 'run ner', 'run_ner', 'runner!', '🏃running',
+                 '관리자김', 'highfive팀', '', '   ']
         for value in cases:
             with self.subTest(value=value):
                 res = self.client.post(NICKNAME, {'nickname': value})
                 self.assertEqual(res.status_code, 400, value)
+
+    def test_닉네임은_12자까지_허용한다(self):
+        value = '가' * 12
+
+        res = self.client.post(NICKNAME, {'nickname': value})
+
+        self.assertEqual(res.status_code, 200)
+        self.profile.refresh_from_db()
+        self.assertEqual(self.profile.nickname, value)
 
     def test_인증_없이는_못_바꾼다(self):
         self.client.credentials()
@@ -285,34 +310,3 @@ class NicknameTest(APITestCase):
         self.assertIn('s', res.data)
         self.assertFalse(res.data['s'])
         self.assertTrue(res.data['msg'])
-
-
-class NicknameCheckTest(APITestCase):
-    def setUp(self):
-        with patch('user_manager.views.verify_id_token', return_value=_account()):
-            res = self.client.post(SIGNIN, {'idToken': 'x'})
-        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {res.data["access"]}')
-
-        self.taken = Profile.objects.create(
-            user=User.objects.create(username='uid-2'),
-            loginProvider='google', nickname='runner', nicknameKey='runner',
-        )
-
-    def test_빈_이름은_쓸_수_있다(self):
-        res = self.client.get(NICKNAME_CHECK, {'nickname': '새로운이름'})
-        self.assertTrue(res.data['available'])
-
-    def test_쓰는_이름은_불가로_알려준다(self):
-        res = self.client.get(NICKNAME_CHECK, {'nickname': 'runner'})
-        self.assertFalse(res.data['available'])
-        self.assertTrue(res.data['msg'])
-
-    def test_규칙_위반은_이유를_알려준다(self):
-        res = self.client.get(NICKNAME_CHECK, {'nickname': 'a'})
-        self.assertFalse(res.data['available'])
-        self.assertIn('15자', res.data['msg'])
-
-    def test_인증_없이는_못_본다(self):
-        self.client.credentials()
-        res = self.client.get(NICKNAME_CHECK, {'nickname': 'runner'})
-        self.assertEqual(res.status_code, 401)

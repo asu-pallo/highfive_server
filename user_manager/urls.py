@@ -9,5 +9,4 @@ urlpatterns = [
     path('auth/autologin/', views.auto_login),
 
     path('users/nickname/', views.set_nickname),
-    path('users/nickname/check/', views.check_nickname),
 ]

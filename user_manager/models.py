@@ -27,12 +27,14 @@ class Profile(models.Model):
 
     # ── 닉네임 ──
     #
-    # 화면에 보이는 값과 중복 판정용 값을 나눈다. 중복은 `nicknameKey` 로만 본다.
-    # 대소문자만 다른 닉네임("Runner" / "runner")과 유니코드 유사 문자를 쓴 우회를
-    # 함께 막기 위해서다. 자세한 정규화 규칙은 nickname.py 참고.
-    nickname = models.CharField(max_length=20, null=True, blank=True, default=None)
+    # **중복을 허용한다.** 사람 이름처럼 겹쳐도 되는 표시용 이름이라, 먼저 온 사람이
+    # 흔한 이름을 선점하는 걸 막지 않는다. 사용자 식별은 `user_id` 가 한다.
+    nickname = models.CharField(max_length=12, null=True, blank=True, default=None)
+
+    # 검색·정렬용 정규화 값(NFKC + 소문자). 중복 판정에는 쓰지 않는다.
+    # 나중에 닉네임 검색이나 멘션을 붙일 때 대소문자·전각을 신경 쓰지 않으려고 남겨 둔다.
     nicknameKey = models.CharField(
-        max_length=20, unique=True, null=True, blank=True, default=None
+        max_length=12, null=True, blank=True, default=None, db_index=True
     )
 
     loginProvider = models.CharField(

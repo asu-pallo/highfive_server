@@ -159,31 +159,6 @@ def auto_login(request):
     })
 
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def check_nickname(request):
-    """쓸 수 있는 닉네임인지 미리 확인한다.
-
-    **여기서 통과해도 등록 시점에 실패할 수 있다.** 그 사이 다른 사람이 같은 이름을
-    가져갈 수 있기 때문이다. 최종 판정은 [set_nickname] 의 DB 제약이 한다.
-    """
-    try:
-        _, key = nickname_rules.validate(request.query_params.get('nickname', ''))
-    except nickname_rules.NicknameError as error:
-        return Response({'s': True, 'available': False, 'msg': str(error)})
-
-    taken = (
-        Profile.objects.filter(nicknameKey=key)
-        .exclude(user=request.user)
-        .exists()
-    )
-    return Response({
-        's': True,
-        'available': not taken,
-        'msg': '이미 사용 중인 닉네임이에요.' if taken else '',
-    })
-
-
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def set_nickname(request):
@@ -197,16 +172,11 @@ def set_nickname(request):
     except nickname_rules.NicknameError as error:
         return _fail(str(error))
 
+    # **중복을 막지 않는다.** 같은 이름을 여러 사람이 써도 되고, 사용자 식별은
+    # user_id 가 한다. 그래서 미리 확인하는 API 도, 409 도 없다.
     profile = request.user.profile
     profile.nickname = value
     profile.nicknameKey = key
-
-    try:
-        # 중복을 미리 조회해서 막지 않는다. 조회와 저장 사이에 다른 요청이 끼어들면
-        # 뚫리기 때문이다(check-then-act). unique 제약이 걸리는 걸 잡아서 처리한다.
-        with transaction.atomic():
-            profile.save(update_fields=['nickname', 'nicknameKey', 'lastLoginAt'])
-    except IntegrityError:
-        return _fail('이미 사용 중인 닉네임이에요.', status.HTTP_409_CONFLICT)
+    profile.save(update_fields=['nickname', 'nicknameKey', 'lastLoginAt'])
 
     return Response({'s': True, 'profile': ProfileSerializer(profile).data})
