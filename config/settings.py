@@ -48,6 +48,11 @@ if not DEBUG and not ALLOWED_HOSTS:
 # Application definition
 
 INSTALLED_APPS = [
+    # ⚠️ django.contrib.* 보다 **앞에** 둔다.
+    # Django 는 INSTALLED_APPS 를 뒤에서부터 훑으며 관리 명령을 등록해서, 앞에 있는 앱이
+    # 이긴다. 뒤에 두면 staticfiles 의 runserver 가 우리 것을 덮어쓴다.
+    'user_manager',
+
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -165,6 +170,9 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
     ),
+    # 프레임워크가 내는 오류(인증 실패 등)도 뷰와 같은 `{'s': False, 'msg': ...}` 형태로
+    # 맞춘다. 안 맞추면 앱이 오류 형식 두 가지를 다뤄야 한다.
+    'EXCEPTION_HANDLER': 'config.api.exception_handler',
     'TEST_REQUEST_DEFAULT_FORMAT': 'json',
 }
 
@@ -209,3 +217,18 @@ CORS_ALLOWED_ORIGINS = [
     o for o in os.getenv('CORS_ALLOWED_ORIGINS', '').split(',') if o
 ]
 CORS_ALLOW_CREDENTIALS = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Firebase
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 앱은 Firebase Auth 로 구글·애플 로그인을 하고, 서버는 그 ID 토큰을 검증한다.
+# 서비스 계정 키(JSON)는 관리자 권한을 가진 비밀 파일이라 저장소에 넣지 않는다.
+# Firebase 콘솔 → 프로젝트 설정 → 서비스 계정에서 내려받아 경로만 .env 에 적는다.
+
+_firebase = os.getenv('FIREBASE_CREDENTIALS', '').strip()
+FIREBASE_CREDENTIALS = (BASE_DIR / _firebase) if _firebase else None
+
+if not DEBUG and FIREBASE_CREDENTIALS is None:
+    raise RuntimeError('운영 모드인데 FIREBASE_CREDENTIALS 가 설정되지 않았다.')

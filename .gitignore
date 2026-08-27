@@ -10,6 +10,8 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.python-version
+.python-version.*
 
 # 가상환경. 이름이 팀마다 달라 흔한 것들을 모두 막는다.
 venv/
@@ -28,6 +30,7 @@ wheels/
 *.egg-info/
 *.egg
 MANIFEST
+pip-wheel-metadata/
 
 # ─────────────────────────────────────────────
 # ⚠️ 비밀값. 유출되면 서버와 사용자 데이터가 통째로 열린다.
@@ -43,10 +46,17 @@ local_settings.py
 *serviceAccount*.json
 *firebase-adminsdk*.json
 
+# 비밀 파일 폴더는 자리 표시자만 추적한다.
+/secrets/*
+!/secrets/.gitignore
+
 # ─────────────────────────────────────────────
 # Django
 db.sqlite3
 db.sqlite3-journal
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
 
 # 사용자가 올린 파일. 저장소가 아니라 스토리지에 둔다.
 /media/
@@ -60,6 +70,10 @@ db.sqlite3-journal
 # ─────────────────────────────────────────────
 # 테스트·커버리지
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.nox/
 .tox/
 .coverage
 .coverage.*
@@ -67,6 +81,12 @@ htmlcov/
 coverage.xml
 *.cover
 .hypothesis/
+
+# 개발 서버·작업 프로세스가 만드는 로컬 상태
+*.pid
+*.pid.lock
+celerybeat-schedule
+celerybeat.pid
 
 # ─────────────────────────────────────────────
 # 에디터·OS
