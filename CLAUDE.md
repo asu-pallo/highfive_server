@@ -22,10 +22,11 @@ API 스펙이나 데이터 형식이 궁금하면 **추측하지 말고 앱 코�
 
 ## 현재 상태
 
-**사용자·인증까지 되어 있다.** 러닝 기록과 하이파이브 판정은 아직 없다.
+**사용자·인증과 운동 메타데이터 동기화까지 되어 있다.** 위치 경로와 하이파이브 판정은 아직 없다.
 
 - `user_manager` — Profile 모델 + 소셜/자동 로그인 + 닉네임 API. 테스트 36개
-- 러닝 기록 테이블 없음. 앱은 아직 건강 데이터를 **기기 안에서만** 다룬다
+- `workout_manager` — 사용자별 운동 멱등 업로드 + 서버 시각 기반 증분 다운로드
+- 앱 피드는 서버에서 내려받아 Drift에 캐시한 운동만 표시한다
 - DB 는 개발용 SQLite. 운영 DB 는 미정
 - git 저장소다(앱과 별개). 커밋은 유저가 직접 관리한다
 
@@ -60,12 +61,16 @@ server/
 │  ├─ urls.py      # 앱이 부르는 엔드포인트는 전부 /api/ 아래
 │  ├─ asgi.py
 │  └─ wsgi.py
-└─ user_manager/   # 사용자·인증
+├─ user_manager/   # 사용자·인증
    ├─ models.py       Profile
    ├─ views.py        signin · autologin · nickname
    ├─ firebase.py     ID 토큰 검증
    ├─ nickname.py     정규화·검증 규칙
    └─ management/commands/runserver.py   # 아래 참고
+└─ workout_manager/ # 운동 저장·증분 동기화
+   ├─ models.py       Workout
+   ├─ serializers.py  업로드 검증·다운로드 응답
+   └─ views.py        upload_workouts · download_workouts
 ```
 
 > **`runserver` 를 덮어썼다.** 기본이 `127.0.0.1` 이라 실기기가 못 붙고,
@@ -114,6 +119,8 @@ cp .env.example .env      # DJANGO_SECRET_KEY 를 채운다
 | `POST /api/auth/signin/` | 공개 | **소셜 로그인.** 가입을 겸한다 |
 | `POST /api/auth/autologin/` | 공개 | **자동 로그인.** refresh 토큰으로 세션을 잇는다 |
 | `POST /api/users/nickname/` | 인증 | 닉네임 설정·변경 |
+| `POST /api/workouts/upload/` | 인증 | 건강 플랫폼 운동 메타데이터 멱등 업로드 |
+| `GET /api/workouts/?since=<UTC>` | 인증 | 서버 스냅샷 시각까지 변경된 내 운동 다운로드 |
 
 **로그인은 이 둘뿐이다. 별도의 회원가입 API 도, 기기 정보 API 도 없다.**
 
@@ -174,18 +181,13 @@ createdAt  lastLoginAt
 ## 닉네임
 
 - `Profile.nickname` — 화면에 보이는 값
-- `Profile.nicknameKey` — 중복 판정용. **unique 는 여기에만** 건다
-- 앞뒤 공백을 제거한 뒤 **2~20자**만 허용한다
-- 한글 완성형·영문·숫자와 글자 사이 공백을 허용한다. 밑줄·이모지는 허용하지 않는다
-- 연속된 중간 공백은 한 칸으로 합쳐 공백 개수만 다른 중복 닉네임을 막는다
+- `Profile.nicknameKey` — 검색·정렬용 정규화 값. 중복 판정에는 쓰지 않는다
+- 앞뒤 공백을 제거한 뒤 **2~12자**만 허용한다
+- 한글 완성형·영문·숫자만 허용하며 공백·밑줄·이모지는 허용하지 않는다
 
-키는 NFKC 정규화 + `casefold()` 다. `Runner` / `runner` / `ｒｕｎｎｅｒ` 가 모두 같은
-이름으로 취급된다. **정규화가 문자 검사보다 먼저** 돌아야 한다 — 순서가 바뀌면 전각
-입력이 "쓸 수 없는 문자" 로 거절돼 안내가 엉뚱해진다.
-
-중복은 조회로 막지 않고 **DB unique 제약이 걸리는 걸 잡아서** 처리한다(409).
-`check` API 는 편의일 뿐이고 최종 판정은 저장 시점에 한다 — 조회와 저장 사이에 다른
-요청이 끼어들 수 있기 때문이다(열품타가 이 경쟁에 열려 있다).
+키는 NFKC 정규화 + `casefold()` 다. `Runner` / `runner` / `ｒｕｎｎｅｒ` 를 검색할 때
+같은 값으로 찾기 위한 것이며, 닉네임 자체는 중복을 허용한다. 사용자 식별은 닉네임이
+아니라 `user_id`로 한다. 정규화는 문자 검사보다 먼저 수행한다.
 
 ## 문서
 

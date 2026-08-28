@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     # Django 는 INSTALLED_APPS 를 뒤에서부터 훑으며 관리 명령을 등록해서, 앞에 있는 앱이
     # 이긴다. 뒤에 두면 staticfiles 의 runserver 가 우리 것을 덮어쓴다.
     'user_manager',
+    'workout_manager',
 
     'django.contrib.admin',
     'django.contrib.auth',
