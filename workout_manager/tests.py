@@ -13,6 +13,7 @@ from django.test import TransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import Workout
+from .views import _workout_page_size
 
 
 UPLOAD = '/api/workouts/upload/'
@@ -160,6 +161,40 @@ class WorkoutApiTest(APITestCase):
         response = self.client.get(DOWNLOAD, {'since': cursor.isoformat()})
 
         self.assertEqual([item['id'] for item in response.data['workouts']], ['new'])
+
+    def test_운동_목록은_20개씩_커서_페이징한다(self):
+        start = timezone.now() - timedelta(days=30)
+        Workout.objects.bulk_create([
+            Workout(
+                user=self.user,
+                source='healthConnect',
+                sourceName='test.app',
+                sourceWorkoutId=f'page-{index:02d}',
+                kind='running',
+                startAt=start + timedelta(days=index),
+                endAt=start + timedelta(days=index, hours=1),
+            )
+            for index in range(25)
+        ])
+
+        response = self.client.get(DOWNLOAD)
+        snapshot = response.data['serverTime']
+        downloaded_ids = []
+
+        while True:
+            page_ids = [item['serverId'] for item in response.data['workouts']]
+            self.assertLessEqual(len(page_ids), _workout_page_size)
+            self.assertFalse(set(downloaded_ids) & set(page_ids))
+            downloaded_ids.extend(page_ids)
+            if not response.data['hasMore']:
+                self.assertIsNone(response.data['nextCursor'])
+                break
+            response = self.client.get(DOWNLOAD, {
+                'cursor': response.data['nextCursor'],
+                'snapshot': snapshot,
+            })
+
+        self.assertEqual(len(downloaded_ids), 25)
 
     def test_다른_사용자_운동은_받지_않는다(self):
         other = User.objects.create_user(username='other')

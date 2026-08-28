@@ -1,12 +1,16 @@
 import hashlib
 import json
 import threading
+import base64
+import binascii
+import time
 from contextlib import nullcontext
 
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.conf import settings
 from django.db import connection, transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
@@ -21,6 +25,7 @@ from .serializers import WorkoutSerializer, WorkoutUploadSerializer
 # SQLite는 동시 쓰기를 지원하지 않는다. 로컬 개발 서버에서 파일 업로드 자체는 병렬로
 # 진행하되, 마지막 DB 반영 몇 ms만 한 요청씩 처리한다. PostgreSQL에서는 사용하지 않는다.
 _sqlite_write_lock = threading.Lock()
+_workout_page_size = 20
 
 
 def _fail(message: str, code: int = status.HTTP_400_BAD_REQUEST) -> Response:
@@ -185,8 +190,11 @@ def _validate_detail(detail, metadata):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def download_workouts(request):
-    """서버 스냅샷 시각까지 변경된 내 운동을 반환한다."""
-    snapshot_at = timezone.now()
+    """서버 스냅샷 시각까지 변경된 내 운동을 20건씩 반환한다."""
+    snapshot_value = request.query_params.get('snapshot')
+    snapshot_at = parse_datetime(snapshot_value) if snapshot_value else timezone.now()
+    if snapshot_at is None or timezone.is_naive(snapshot_at):
+        return _fail('snapshot은 시간대가 포함된 ISO 8601 시각이어야 합니다.')
     workouts = Workout.objects.filter(
         user=request.user,
         updatedAt__lte=snapshot_at,
@@ -199,11 +207,52 @@ def download_workouts(request):
             return _fail('since는 시간대가 포함된 ISO 8601 시각이어야 합니다.')
         workouts = workouts.filter(updatedAt__gt=since)
 
-    workouts = workouts.order_by('updatedAt', 'id')
+    # 개발 중 전역·하단 페이징 로더를 눈으로 확인하기 위한 지연이다.
+    # 운영 환경(DEBUG=False)에는 적용하지 않는다.
+    # if settings.DEBUG:
+    #     time.sleep(1)
+
+    cursor_value = request.query_params.get('cursor')
+    if cursor_value:
+        try:
+            padding = '=' * (-len(cursor_value) % 4)
+            decoded = json.loads(base64.urlsafe_b64decode(cursor_value + padding))
+            cursor_at = parse_datetime(decoded['updatedAt'])
+            cursor_id = int(decoded['id'])
+            if cursor_at is None or timezone.is_naive(cursor_at):
+                raise ValueError
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            UnicodeDecodeError,
+            binascii.Error,
+            json.JSONDecodeError,
+        ):
+            return _fail('cursor 형식이 올바르지 않습니다.')
+        workouts = workouts.filter(
+            Q(updatedAt__lt=cursor_at) |
+            Q(updatedAt=cursor_at, id__lt=cursor_id)
+        )
+
+    page = list(workouts.order_by('-updatedAt', '-id')[:_workout_page_size + 1])
+    has_more = len(page) > _workout_page_size
+    page = page[:_workout_page_size]
+    next_cursor = None
+    if has_more:
+        last = page[-1]
+        payload = json.dumps({
+            'updatedAt': last.updatedAt.isoformat(),
+            'id': last.id,
+        }, separators=(',', ':')).encode()
+        next_cursor = base64.urlsafe_b64encode(payload).decode().rstrip('=')
+
     return Response({
         's': True,
         'serverTime': snapshot_at,
-        'workouts': WorkoutSerializer(workouts, many=True).data,
+        'workouts': WorkoutSerializer(page, many=True).data,
+        'nextCursor': next_cursor,
+        'hasMore': has_more,
     })
 
 
