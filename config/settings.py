@@ -106,6 +106,14 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+        # 로컬에서도 운동 파일 3건이 병렬 업로드된다. IMMEDIATE 트랜잭션은
+        # 여러 요청이 읽은 뒤 동시에 쓰기로 승격하며 즉시 실패하는 상황을 막고,
+        # timeout 동안 순서대로 짧은 쓰기 구간을 처리하게 한다.
+        'OPTIONS': {
+            'timeout': 20,
+            'transaction_mode': 'IMMEDIATE',
+            'init_command': 'PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL',
+        },
     }
 }
 
@@ -146,6 +154,34 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
+
+# 운동 경로·심박 원본 파일 저장소. 로컬에서는 값이 없으면 파일시스템을 사용하고,
+# MinIO/S3 환경 변수를 넣으면 코드 변경 없이 비공개 객체 저장소로 전환된다.
+MEDIA_ROOT = BASE_DIR / '.local-media'
+MEDIA_URL = '/media/'
+_workout_bucket = os.getenv('S3_BUCKET_NAME', '').strip()
+if _workout_bucket:
+    STORAGES = {
+        'default': {
+            'BACKEND': 'storages.backends.s3.S3Storage',
+            'OPTIONS': {
+                'bucket_name': _workout_bucket,
+                'access_key': os.getenv('S3_ACCESS_KEY'),
+                'secret_key': os.getenv('S3_SECRET_KEY'),
+                'endpoint_url': os.getenv('S3_ENDPOINT_URL') or None,
+                'region_name': os.getenv('S3_REGION', 'ap-northeast-2'),
+                'default_acl': None,
+                'querystring_auth': True,
+                'file_overwrite': False,
+            },
+        },
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    }
+
+# multipart 전체를 메모리에 무제한 올리지 않는다.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv('WORKOUT_UPLOAD_MAX_BYTES', 25 * 1024 * 1024))
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

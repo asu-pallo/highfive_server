@@ -60,6 +60,7 @@ db.sqlite3-journal
 
 # 사용자가 올린 파일. 저장소가 아니라 스토리지에 둔다.
 /media/
+/.local-media/
 
 # collectstatic 결과물. 원본은 각 앱의 static/ 에 있다.
 /staticfiles/
@@ -87,6 +88,7 @@ coverage.xml
 *.pid.lock
 celerybeat-schedule
 celerybeat.pid
+/.run/
 
 # ─────────────────────────────────────────────
 # 에디터·OS

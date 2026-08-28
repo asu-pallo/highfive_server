@@ -37,3 +37,17 @@ class Workout(models.Model):
             models.Index(fields=('user', 'startAt')),
         ]
 
+
+class WorkoutDetail(models.Model):
+    """지도 경로·심박 원본 JSON 파일의 객체 저장소 메타데이터."""
+
+    workout = models.OneToOneField(
+        Workout, on_delete=models.CASCADE, related_name='detail'
+    )
+    objectKey = models.CharField(max_length=700, unique=True)
+    contentHash = models.CharField(max_length=64)
+    formatVersion = models.PositiveSmallIntegerField(default=1)
+    routePointCount = models.PositiveIntegerField(default=0)
+    heartRateSampleCount = models.PositiveIntegerField(default=0)
+    fileSize = models.PositiveBigIntegerField(default=0)
+    updatedAt = models.DateTimeField(auto_now=True)
