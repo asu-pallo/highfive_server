@@ -4,7 +4,16 @@ from . import views
 
 
 urlpatterns = [
-    path('workouts/upload/', views.upload_workouts, name='workout-upload'),
+    path(
+        'workouts/upload/prepare/',
+        views.prepare_workout_upload,
+        name='workout-upload-prepare',
+    ),
+    path(
+        'workouts/upload/complete/',
+        views.complete_workout_upload,
+        name='workout-upload-complete',
+    ),
     path('workouts/', views.download_workouts, name='workout-download'),
     path(
         'workouts/<int:workout_id>/detail/',

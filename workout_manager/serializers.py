@@ -32,11 +32,22 @@ class WorkoutUploadSerializer(serializers.Serializer):
         return attrs
 
 
+class WorkoutUploadPrepareSerializer(WorkoutUploadSerializer):
+    fileSize = serializers.IntegerField(min_value=1)
+
+
+class WorkoutUploadCompleteSerializer(serializers.Serializer):
+    uploadId = serializers.UUIDField()
+
+
 class WorkoutSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source='sourceWorkoutId')
     serverId = serializers.IntegerField(source='pk')
     routePointCount = serializers.IntegerField(
         source='detail.routePointCount', read_only=True, default=0
+    )
+    detailContentHash = serializers.CharField(
+        source='detail.contentHash', read_only=True, default=''
     )
 
     class Meta:
@@ -61,4 +72,5 @@ class WorkoutSerializer(serializers.ModelSerializer):
             'updatedAt',
             'deletedAt',
             'routePointCount',
+            'detailContentHash',
         )
