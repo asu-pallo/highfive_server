@@ -11,4 +11,9 @@ urlpatterns = [
         views.download_workout_detail,
         name='workout-detail',
     ),
+    path(
+        'workouts/<int:workout_id>/h3/',
+        views.download_workout_h3,
+        name='workout-h3',
+    ),
 ]

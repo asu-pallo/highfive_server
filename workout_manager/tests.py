@@ -6,13 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connections
 from django.utils import timezone
 from rest_framework.test import APITestCase
 from rest_framework.test import APIClient
 from django.test import TransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Workout
+from .models import SpatialIndexVersion, TrajectorySegment, Workout
 from .views import _workout_page_size
 
 
@@ -92,7 +93,80 @@ class WorkoutApiTest(APITestCase):
         server_id = downloaded.data['workouts'][0]['serverId']
         detail = self.client.get(f'/api/workouts/{server_id}/detail/')
         self.assertEqual(detail.status_code, 200)
-        self.assertEqual(len(detail.data['detail']['route']), 1)
+        self.assertIn('downloadUrl', detail.data)
+        self.assertNotIn('detail', detail.data)
+        self.assertEqual(detail.data['expiresInSeconds'], 300)
+
+    def test_원본_경로를_h3_체류_구간으로_저장한다(self):
+        metadata = _workout()
+        middle = datetime.fromisoformat(metadata['startAt']) + timedelta(minutes=10)
+        response = self.client.post(
+            UPLOAD,
+            _upload_payload(detail_overrides={'route': [
+                {
+                    'timestamp': metadata['startAt'],
+                    'latitude': 37.5,
+                    'longitude': 127.0,
+                },
+                {
+                    'timestamp': middle.isoformat(),
+                    'latitude': 37.501,
+                    'longitude': 127.001,
+                },
+            ]}),
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        segments = list(TrajectorySegment.objects.order_by('sequence'))
+        self.assertEqual(response.data['trajectorySegmentCount'], len(segments))
+        version = SpatialIndexVersion.objects.get()
+        self.assertEqual(version.indexType, 'h3')
+        self.assertEqual(version.parameters, {'resolution': 11})
+        self.assertGreater(len(segments), 1)
+        self.assertEqual(
+            [segment.sequence for segment in segments],
+            list(range(len(segments))),
+        )
+        self.assertEqual(segments[0].period.lower, datetime.fromisoformat(metadata['startAt']))
+        self.assertEqual(segments[-1].period.upper, datetime.fromisoformat(metadata['endAt']))
+        self.assertTrue(all(segment.period.bounds == '[)' for segment in segments))
+
+        h3_response = self.client.get(f'/api/workouts/{segments[0].workout_id}/h3/')
+        self.assertEqual(h3_response.status_code, 200)
+        self.assertEqual(h3_response.data['resolution'], 11)
+        self.assertEqual(len(h3_response.data['segments']), len(segments))
+        self.assertEqual(len(h3_response.data['segments'][0]['boundary']), 6)
+
+    def test_다른_사용자의_h3_구간은_받지_못한다(self):
+        self.client.post(UPLOAD, _upload_payload(), format='multipart')
+        workout_id = Workout.objects.get().pk
+        other = User.objects.create_user(username='other-h3-user')
+        access = RefreshToken.for_user(other).access_token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
+
+        response = self.client.get(f'/api/workouts/{workout_id}/h3/')
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_상세_경로가_바뀌면_h3_구간을_교체한다(self):
+        self.client.post(UPLOAD, _upload_payload(), format='multipart')
+        original_ids = set(TrajectorySegment.objects.values_list('id', flat=True))
+
+        response = self.client.post(
+            UPLOAD,
+            _upload_payload(detail_overrides={'route': [{
+                'timestamp': _workout()['startAt'],
+                'latitude': 37.51,
+                'longitude': 127.01,
+            }]}),
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        replaced_ids = set(TrajectorySegment.objects.values_list('id', flat=True))
+        self.assertTrue(replaced_ids)
+        self.assertTrue(original_ids.isdisjoint(replaced_ids))
 
     def test_다른_사용자의_상세_파일은_받지_못한다(self):
         self.client.post(UPLOAD, _upload_payload(), format='multipart')
@@ -245,13 +319,16 @@ class WorkoutParallelUploadTest(TransactionTestCase):
         self.access = str(RefreshToken.for_user(self.user).access_token)
 
     def _upload(self, workout_id):
-        client = APIClient()
-        client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.access}')
-        return client.post(
-            UPLOAD,
-            _upload_payload(workout_id),
-            format='multipart',
-        ).status_code
+        try:
+            client = APIClient()
+            client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.access}')
+            return client.post(
+                UPLOAD,
+                _upload_payload(workout_id),
+                format='multipart',
+            ).status_code
+        finally:
+            connections.close_all()
 
     def test_운동_세_건을_병렬로_올려도_잠금_실패가_없다(self):
         with ThreadPoolExecutor(max_workers=3) as executor:

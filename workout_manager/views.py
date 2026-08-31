@@ -1,15 +1,14 @@
 import hashlib
 import json
-import threading
 import base64
 import binascii
-import time
-from contextlib import nullcontext
 
+import boto3
+import h3
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.conf import settings
-from django.db import connection, transaction
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -18,13 +17,11 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Workout, WorkoutDetail
+from .models import TrajectorySegment, Workout, WorkoutDetail
 from .serializers import WorkoutSerializer, WorkoutUploadSerializer
+from .spatial_index import ensure_h3_segments, rebuild_h3_segments
 
 
-# SQLite는 동시 쓰기를 지원하지 않는다. 로컬 개발 서버에서 파일 업로드 자체는 병렬로
-# 진행하되, 마지막 DB 반영 몇 ms만 한 요청씩 처리한다. PostgreSQL에서는 사용하지 않는다.
-_sqlite_write_lock = threading.Lock()
 _workout_page_size = 20
 
 
@@ -90,8 +87,7 @@ def upload_workouts(request):
         'sourceName': data['sourceName'],
         'sourceWorkoutId': data['sourceWorkoutId'],
     }
-    # 객체 저장은 네트워크 I/O라 DB 트랜잭션 안에서 수행하면 SQLite 쓰기 잠금을
-    # 오래 잡는다. 내용 해시 기반 키로 먼저 저장하고 DB 쓰기는 짧게 끝낸다.
+    # 객체 저장은 네트워크 I/O이므로 DB 트랜잭션 밖에서 내용 해시 기반 키로 먼저 저장한다.
     new_key = f'workouts/{request.user.id}/{content_hash}.json'
     object_created = False
     if not default_storage.exists(new_key):
@@ -100,8 +96,7 @@ def upload_workouts(request):
 
     old_key = None
     try:
-        write_lock = _sqlite_write_lock if connection.vendor == 'sqlite' else nullcontext()
-        with write_lock, transaction.atomic():
+        with transaction.atomic():
             defaults = {field: data.get(field) for field in mutable_fields}
             defaults.update(heart_summary)
             workout, created = Workout.objects.get_or_create(**identity, defaults=defaults)
@@ -119,10 +114,12 @@ def upload_workouts(request):
 
             current = WorkoutDetail.objects.filter(workout=workout).first()
             if current and current.contentHash == content_hash:
+                segment_count = ensure_h3_segments(workout, detail_json['route'])
                 return Response({
                     's': True,
                     'created': created,
                     'unchanged': not created and not changed,
+                    'trajectorySegmentCount': segment_count,
                 })
 
             old_key = current.objectKey if current else None
@@ -140,6 +137,7 @@ def upload_workouts(request):
             # 메타데이터가 같고 경로·심박 파일만 달라져도 증분 다운로드에 포함돼야 한다.
             if not created and not changed:
                 workout.save(update_fields=['updatedAt'])
+            segment_count = rebuild_h3_segments(workout, detail_json['route'])
     except Exception:
         if object_created and new_key != old_key and default_storage.exists(new_key):
             default_storage.delete(new_key)
@@ -147,7 +145,12 @@ def upload_workouts(request):
 
     if old_key and old_key != new_key and default_storage.exists(old_key):
         default_storage.delete(old_key)
-    return Response({'s': True, 'created': created, 'unchanged': False})
+    return Response({
+        's': True,
+        'created': created,
+        'unchanged': False,
+        'trajectorySegmentCount': segment_count,
+    })
 
 
 def _validate_detail(detail, metadata):
@@ -173,11 +176,20 @@ def _validate_detail(detail, metadata):
         if actual is None or actual != metadata[metadata_key]:
             return f'상세 파일의 {detail_key} 값이 메타데이터와 다릅니다.'
     try:
+        previous_timestamp = None
         for point in detail['route']:
+            timestamp = parse_datetime(str(point['timestamp']))
             latitude = float(point['latitude'])
             longitude = float(point['longitude'])
+            if timestamp is None or timezone.is_naive(timestamp):
+                return '경로 좌표 시각 형식이 올바르지 않습니다.'
+            if not metadata['startAt'] <= timestamp <= metadata['endAt']:
+                return '경로 좌표 시각이 운동 시간 범위를 벗어났습니다.'
+            if previous_timestamp is not None and timestamp < previous_timestamp:
+                return '경로 좌표 시각은 오름차순이어야 합니다.'
             if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
                 return '경로 좌표 범위가 올바르지 않습니다.'
+            previous_timestamp = timestamp
         for sample in detail['heartRate']:
             bpm = float(sample['bpm'])
             if not 1 <= bpm <= 300:
@@ -206,11 +218,6 @@ def download_workouts(request):
         if since is None or timezone.is_naive(since):
             return _fail('since는 시간대가 포함된 ISO 8601 시각이어야 합니다.')
         workouts = workouts.filter(updatedAt__gt=since)
-
-    # 개발 중 전역·하단 페이징 로더를 눈으로 확인하기 위한 지연이다.
-    # 운영 환경(DEBUG=False)에는 적용하지 않는다.
-    # if settings.DEBUG:
-    #     time.sleep(1)
 
     cursor_value = request.query_params.get('cursor')
     if cursor_value:
@@ -259,7 +266,7 @@ def download_workouts(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def download_workout_detail(request, workout_id):
-    """내 운동의 경로·심박 원본 파일을 반환한다."""
+    """내 운동의 경로·심박 원본 파일을 받을 짧은 다운로드 URL을 반환한다."""
     try:
         workout = Workout.objects.select_related('detail').get(
             pk=workout_id,
@@ -271,12 +278,77 @@ def download_workout_detail(request, workout_id):
         return _fail('운동 상세 정보를 찾을 수 없습니다.', status.HTTP_404_NOT_FOUND)
 
     try:
-        with default_storage.open(detail.objectKey, 'rb') as stored:
-            payload = json.load(stored)
-    except (OSError, TypeError, ValueError, UnicodeDecodeError):
+        download_url = _detail_download_url(request, detail.objectKey)
+    except (OSError, TypeError, ValueError):
         return _fail(
-            '운동 상세 파일을 읽지 못했습니다.',
+            '운동 상세 파일 다운로드 주소를 만들지 못했습니다.',
             status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    return Response({'s': True, 'detail': payload})
+    return Response({
+        's': True,
+        'downloadUrl': download_url,
+        'expiresInSeconds': settings.S3_DOWNLOAD_EXPIRES_SECONDS,
+        'contentHash': detail.contentHash,
+        'fileSize': detail.fileSize,
+    })
+
+
+def _detail_download_url(request, object_key: str) -> str:
+    public_endpoint = settings.S3_PUBLIC_ENDPOINT_URL
+    if not settings.S3_BUCKET_NAME or not public_endpoint:
+        return request.build_absolute_uri(default_storage.url(object_key))
+
+    client = boto3.client(
+        's3',
+        endpoint_url=public_endpoint,
+        aws_access_key_id=settings.S3_ACCESS_KEY,
+        aws_secret_access_key=settings.S3_SECRET_KEY,
+        region_name=settings.S3_REGION,
+    )
+    return client.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': settings.S3_BUCKET_NAME, 'Key': object_key},
+        ExpiresIn=settings.S3_DOWNLOAD_EXPIRES_SECONDS,
+    )
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def download_workout_h3(request, workout_id):
+    """내 운동의 현재 H3 체류 구간과 표시용 셀 경계를 반환한다."""
+    try:
+        workout = Workout.objects.get(
+            pk=workout_id,
+            user=request.user,
+            deletedAt__isnull=True,
+        )
+    except Workout.DoesNotExist:
+        return _fail('운동 기록을 찾을 수 없습니다.', status.HTTP_404_NOT_FOUND)
+
+    segments = list(
+        TrajectorySegment.objects.select_related('indexVersion')
+        .filter(workout=workout, indexVersion__isActive=True)
+        .order_by('sequence')
+    )
+    version = segments[0].indexVersion if segments else None
+    resolution = version.parameters.get('resolution') if version else None
+    return Response({
+        's': True,
+        'indexType': version.indexType if version else 'h3',
+        'algorithmVersion': version.algorithmVersion if version else None,
+        'resolution': resolution,
+        'segments': [
+            {
+                'sequence': segment.sequence,
+                'cellId': segment.cellId,
+                'enteredAt': segment.period.lower,
+                'exitedAt': segment.period.upper,
+                'boundary': [
+                    {'latitude': latitude, 'longitude': longitude}
+                    for latitude, longitude in h3.cell_to_boundary(segment.cellId)
+                ],
+            }
+            for segment in segments
+        ],
+    })

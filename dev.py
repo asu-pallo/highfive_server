@@ -53,6 +53,7 @@ def load_environment() -> None:
 def check_python_dependencies() -> None:
     try:
         __import__('django')
+        __import__('psycopg')
         __import__('storages')
     except ImportError:
         raise SystemExit(
@@ -81,6 +82,39 @@ def check_docker() -> None:
         raise SystemExit('Docker Desktop과 Docker Compose가 실행 중인지 확인하세요.')
 
 
+def configure_android_minio_reverse() -> None:
+    """연결된 Android 개발 단말의 localhost:9000을 로컬 MinIO로 전달한다."""
+    public_endpoint = urlparse(os.getenv('S3_PUBLIC_ENDPOINT_URL', ''))
+    if public_endpoint.hostname not in {'localhost', '127.0.0.1'}:
+        return
+    try:
+        result = subprocess.run(
+            ['adb', 'reverse', 'tcp:9000', 'tcp:9000'],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        print('Android adb가 없어 MinIO 포트 전달을 건너뜁니다.')
+        return
+    if result.returncode == 0:
+        print('Android MinIO 연결: 단말 localhost:9000 → Mac localhost:9000')
+    else:
+        print('연결된 Android 단말이 없어 MinIO 포트 전달을 건너뜁니다.')
+
+
+def remove_android_minio_reverse() -> None:
+    try:
+        subprocess.run(
+            ['adb', 'reverse', '--remove', 'tcp:9000'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+
 def wait_for_minio(timeout_seconds: int = 30) -> None:
     endpoint = 'http://localhost:9000/minio/health/ready'
     deadline = time.monotonic() + timeout_seconds
@@ -97,6 +131,20 @@ def wait_for_minio(timeout_seconds: int = 30) -> None:
         ):
             time.sleep(1)
     raise SystemExit(f'MinIO가 {timeout_seconds}초 안에 준비되지 않았습니다.')
+
+
+def wait_for_postgres(timeout_seconds: int = 30) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        result = compose(
+            'exec', '-T', 'postgres',
+            'pg_isready', '-U', os.environ['DB_USER'], '-d', os.environ['DB_NAME'],
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(1)
+    raise SystemExit(f'PostgreSQL이 {timeout_seconds}초 안에 준비되지 않았습니다.')
 
 
 def stop_django() -> None:
@@ -120,19 +168,23 @@ def up() -> None:
     check_docker()
     RUN_DIR.mkdir(exist_ok=True)
 
-    print('[1/4] Docker 개발 서비스를 시작합니다.')
+    print('[1/5] Docker 개발 서비스를 시작합니다.')
     compose('up', '-d')
+    configure_android_minio_reverse()
     try:
-        print('[2/4] MinIO 준비와 비공개 버킷을 확인합니다.')
+        print('[2/5] PostgreSQL 준비를 확인합니다.')
+        wait_for_postgres()
+
+        print('[3/5] MinIO 준비와 비공개 버킷을 확인합니다.')
         wait_for_minio()
         compose('run', '--rm', 'minio-init')
 
-        print('[3/4] Django 마이그레이션을 적용합니다.')
+        print('[4/5] Django 마이그레이션을 적용합니다.')
         run([sys.executable, str(MANAGE_PY), 'migrate'])
 
         host = os.getenv('DEV_SERVER_HOST', '0.0.0.0')
         port = os.getenv('DEV_SERVER_PORT', '8000')
-        print(f'[4/4] Django를 시작합니다: http://{host}:{port}')
+        print(f'[5/5] Django를 시작합니다: http://{host}:{port}')
         print('종료하려면 Ctrl+C를 누르세요. Django 로그는 아래에 바로 출력됩니다.')
 
         process = subprocess.Popen(
@@ -156,6 +208,7 @@ def up() -> None:
 
 def down() -> None:
     stop_django()
+    remove_android_minio_reverse()
     if subprocess.run(
         ['docker', 'info'],
         stdout=subprocess.DEVNULL,
@@ -193,8 +246,19 @@ def logs() -> None:
     compose('logs', '--follow', '--tail', '100', check=False)
 
 
+def database_shell() -> None:
+    load_environment()
+    check_docker()
+    compose('up', '-d', 'postgres')
+    wait_for_postgres()
+    compose(
+        'exec', 'postgres', 'psql',
+        '-U', os.environ['DB_USER'], '-d', os.environ['DB_NAME'],
+    )
+
+
 def reset() -> None:
-    """로컬 SQLite DB와 로컬 MinIO 파일을 삭제하고 빈 상태로 만든다."""
+    """로컬 PostgreSQL 스키마와 MinIO 파일을 삭제하고 빈 상태로 만든다."""
     load_environment()
     check_python_dependencies()
 
@@ -208,37 +272,30 @@ def reset() -> None:
         else:
             raise SystemExit('Django가 실행 중입니다. 먼저 python dev.py down을 실행하세요.')
 
-    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
-    import django
-    django.setup()
-    from django.conf import settings
-
-    database = settings.DATABASES['default']
-    if not settings.DEBUG or database['ENGINE'] != 'django.db.backends.sqlite3':
-        raise SystemExit('개발 모드의 SQLite DB만 초기화할 수 있습니다.')
-
-    db_path = Path(database['NAME']).resolve()
-    if not db_path.is_relative_to(SERVER_DIR) or db_path.name != 'db.sqlite3':
-        raise SystemExit(f'안전하지 않은 DB 경로라 초기화를 중단합니다: {db_path}')
+    database_host = os.environ['DB_HOST']
+    database_name = os.environ['DB_NAME']
+    database_user = os.environ['DB_USER']
+    if database_host not in {'localhost', '127.0.0.1'} or database_name != 'highfive':
+        raise SystemExit(
+            '로컬 HighFive PostgreSQL만 초기화할 수 있습니다. '
+            f'host={database_host}, database={database_name}'
+        )
 
     reset_local_object_storage()
 
-    print(f'로컬 DB를 초기화합니다: {db_path}')
-
-    targets = (
-        db_path,
-        Path(f'{db_path}-wal'),
-        Path(f'{db_path}-shm'),
-        Path(f'{db_path}-journal'),
+    check_docker()
+    compose('up', '-d', 'postgres')
+    wait_for_postgres()
+    print(f'로컬 PostgreSQL 스키마를 초기화합니다: {database_name}')
+    compose(
+        'exec', '-T', 'postgres', 'psql',
+        '-v', 'ON_ERROR_STOP=1', '-U', database_user, '-d', database_name,
+        '-c', 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;',
     )
-    for target in targets:
-        if target.exists():
-            target.unlink()
-            print(f'삭제: {target.name}')
 
     print('빈 DB에 마이그레이션을 적용합니다.')
     run([sys.executable, str(MANAGE_PY), 'migrate'])
-    print('로컬 DB와 MinIO 파일 초기화가 완료됐습니다.')
+    print('로컬 PostgreSQL과 MinIO 파일 초기화가 완료됐습니다.')
 
 
 def reset_local_object_storage() -> None:
@@ -283,7 +340,7 @@ def reset_local_object_storage() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest='command', required=True)
-    for command in ('up', 'down', 'status', 'logs'):
+    for command in ('up', 'down', 'status', 'logs', 'db'):
         subparsers.add_parser(command)
     subparsers.add_parser('reset')
 
@@ -292,7 +349,7 @@ def main() -> None:
         reset()
         up()
     else:
-        {'up': up, 'down': down, 'status': status, 'logs': logs}[
+        {'up': up, 'down': down, 'status': status, 'logs': logs, 'db': database_shell}[
             arguments.command
         ]()
 

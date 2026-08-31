@@ -104,16 +104,14 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-        # 로컬에서도 운동 파일 3건이 병렬 업로드된다. IMMEDIATE 트랜잭션은
-        # 여러 요청이 읽은 뒤 동시에 쓰기로 승격하며 즉시 실패하는 상황을 막고,
-        # timeout 동안 순서대로 짧은 쓰기 구간을 처리하게 한다.
-        'OPTIONS': {
-            'timeout': 20,
-            'transaction_mode': 'IMMEDIATE',
-            'init_command': 'PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL',
-        },
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME', 'highfive'),
+        'USER': os.getenv('DB_USER', 'highfive'),
+        'PASSWORD': os.getenv('DB_PASSWORD', 'highfive-local-password'),
+        'HOST': os.getenv('DB_HOST', '127.0.0.1'),
+        'PORT': os.getenv('DB_PORT', '5432'),
+        'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', '60')),
+        'CONN_HEALTH_CHECKS': True,
     }
 }
 
@@ -159,19 +157,26 @@ STATIC_URL = 'static/'
 # MinIO/S3 환경 변수를 넣으면 코드 변경 없이 비공개 객체 저장소로 전환된다.
 MEDIA_ROOT = BASE_DIR / '.local-media'
 MEDIA_URL = '/media/'
-_workout_bucket = os.getenv('S3_BUCKET_NAME', '').strip()
-if _workout_bucket:
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', '').strip()
+S3_ACCESS_KEY = os.getenv('S3_ACCESS_KEY')
+S3_SECRET_KEY = os.getenv('S3_SECRET_KEY')
+S3_ENDPOINT_URL = os.getenv('S3_ENDPOINT_URL') or None
+S3_PUBLIC_ENDPOINT_URL = os.getenv('S3_PUBLIC_ENDPOINT_URL') or None
+S3_REGION = os.getenv('S3_REGION', 'ap-northeast-2')
+S3_DOWNLOAD_EXPIRES_SECONDS = 300
+if S3_BUCKET_NAME:
     STORAGES = {
         'default': {
             'BACKEND': 'storages.backends.s3.S3Storage',
             'OPTIONS': {
-                'bucket_name': _workout_bucket,
-                'access_key': os.getenv('S3_ACCESS_KEY'),
-                'secret_key': os.getenv('S3_SECRET_KEY'),
-                'endpoint_url': os.getenv('S3_ENDPOINT_URL') or None,
-                'region_name': os.getenv('S3_REGION', 'ap-northeast-2'),
+                'bucket_name': S3_BUCKET_NAME,
+                'access_key': S3_ACCESS_KEY,
+                'secret_key': S3_SECRET_KEY,
+                'endpoint_url': S3_ENDPOINT_URL,
+                'region_name': S3_REGION,
                 'default_acl': None,
                 'querystring_auth': True,
+                'querystring_expire': S3_DOWNLOAD_EXPIRES_SECONDS,
                 'file_overwrite': False,
             },
         },

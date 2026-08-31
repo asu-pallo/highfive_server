@@ -22,12 +22,14 @@ API 스펙이나 데이터 형식이 궁금하면 **추측하지 말고 앱 코�
 
 ## 현재 상태
 
-**사용자·인증과 운동 메타데이터 동기화까지 되어 있다.** 위치 경로와 하이파이브 판정은 아직 없다.
+**사용자·인증, 운동 원본 동기화와 H3 경로 인덱스 저장까지 되어 있다.** 하이파이브
+판정은 아직 없다.
 
-- `user_manager` — Profile 모델 + 소셜/자동 로그인 + 닉네임 API. 테스트 36개
-- `workout_manager` — 사용자별 운동 멱등 업로드 + 서버 시각 기반 증분 다운로드
+- `user_manager` — Profile 모델 + 소셜/자동 로그인 + 닉네임 API
+- `workout_manager` — 운동별 multipart 멱등 업로드 + 비공개 객체 저장 + H3 Resolution 11
+  연속 체류 구간 저장 + 서버 시각 기반 20건 커서 다운로드와 상세 API
 - 앱 피드는 서버에서 내려받아 Drift에 캐시한 운동만 표시한다
-- DB 는 개발용 SQLite. 운영 DB 는 미정
+- DB는 Docker PostgreSQL 17로 전환했다. 객체 저장소는 로컬 MinIO다
 - git 저장소다(앱과 별개). 커밋은 유저가 직접 관리한다
 
 ## 기술 스택
@@ -40,7 +42,18 @@ API 스펙이나 데이터 형식이 궁금하면 **추측하지 말고 앱 코�
 | API | Django REST Framework |
 | 인증 | SimpleJWT (access 30분 / refresh 90일, 회전 + 블랙리스트) |
 | 설정 주입 | python-dotenv (`.env`) |
-| DB | SQLite (개발) |
+| DB | PostgreSQL 17 (로컬 Docker, 운영 AWS RDS) |
+| 객체 저장소 | Django Storage + MinIO (개발), 비공개 S3 (운영) |
+
+### PostgreSQL 선택 방향
+
+- 로컬은 Docker PostgreSQL, 운영은 AWS RDS PostgreSQL을 사용한다.
+- H3 세그먼트의 체류 시간은 `DateTimeRangeField`/`tstzrange`로 저장한다.
+- 하이파이브 후보는 동일 H3 셀과 `period && currentPeriod` 조건으로 조회한다.
+- `btree_gist`와 GiST 복합 인덱스는 실제 실행 계획과 부하 테스트 후 확정한다.
+- 향후 정밀 거리·지역 통계가 필요할 때만 PostGIS를 추가한다. 초기 H3 구현에는 넣지 않는다.
+- GPS·심박 원본은 PostgreSQL에 배열 행으로 넣지 않고 기존처럼 비공개 객체 저장소에 둔다.
+- 기존 SQLite 개발 데이터는 이관하지 않았고 현재 모델 기준 초기 migration을 새로 만들었다.
 
 > **열품타와 다른 점 — JWT 수명.**
 > 열품타는 access 토큰을 36,500일(100년)로 두고 refresh 를 쓰지 않아, 토큰이 유출돼도
@@ -67,10 +80,11 @@ server/
    ├─ firebase.py     ID 토큰 검증
    ├─ nickname.py     정규화·검증 규칙
    └─ management/commands/runserver.py   # 아래 참고
-└─ workout_manager/ # 운동 저장·증분 동기화
-   ├─ models.py       Workout
+└─ workout_manager/ # 운동 저장·상세 파일·증분 동기화
+   ├─ models.py       Workout · WorkoutDetail · SpatialIndexVersion · TrajectorySegment
+   ├─ spatial_index.py H3 Resolution 11 변환·통과 셀 보완·구간 저장
    ├─ serializers.py  업로드 검증·다운로드 응답
-   └─ views.py        upload_workouts · download_workouts
+   └─ views.py        upload_workouts · download_workouts · detail
 ```
 
 > **`runserver` 를 덮어썼다.** 기본이 `127.0.0.1` 이라 실기기가 못 붙고,
@@ -92,11 +106,22 @@ cp .env.example .env      # DJANGO_SECRET_KEY 를 채운다
 .venv/bin/python manage.py migrate
 ```
 
-개발 서버. **기본이 `0.0.0.0:8000`** 이라 그냥 띄우면 실기기에서도 붙는다:
+개발 환경은 `manage.py`와 같은 위치의 `dev.py`로 함께 관리한다. **기본이
+`0.0.0.0:8000`**이라 실기기에서도 붙는다.
 
 ```bash
-.venv/bin/python manage.py runserver
+python dev.py up       # PostgreSQL·MinIO·migrate 후 Django 실행
+python dev.py status   # 서버와 컨테이너 상태
+python dev.py logs     # Docker 로그
+python dev.py db       # 컨테이너의 psql 콘솔
+python dev.py down     # 종료, 데이터 유지
+python dev.py reset    # 로컬 PostgreSQL 스키마·MinIO 초기화 후 다시 up
 ```
+
+Android 실단말의 MinIO 직접 다운로드는 `.env`의
+`S3_PUBLIC_ENDPOINT_URL=http://127.0.0.1:9000`을 사용한다. `dev.py up`은 연결된 단말에
+`adb reverse tcp:9000 tcp:9000`을 설정하고 `down`은 제거한다. MinIO API는 LAN에 직접
+공개하지 않는다.
 
 앱은 `app/lib/src/core/config/api_config.dart` 의 `_devUrl` 을 본다. 실기기로 테스트할
 때는 거기에 **맥의 LAN 주소**가 들어가 있어야 한다(와이파이가 바뀌면 달라진다).
@@ -119,8 +144,19 @@ cp .env.example .env      # DJANGO_SECRET_KEY 를 채운다
 | `POST /api/auth/signin/` | 공개 | **소셜 로그인.** 가입을 겸한다 |
 | `POST /api/auth/autologin/` | 공개 | **자동 로그인.** refresh 토큰으로 세션을 잇는다 |
 | `POST /api/users/nickname/` | 인증 | 닉네임 설정·변경 |
-| `POST /api/workouts/upload/` | 인증 | 건강 플랫폼 운동 메타데이터 멱등 업로드 |
-| `GET /api/workouts/?since=<UTC>` | 인증 | 서버 스냅샷 시각까지 변경된 내 운동 다운로드 |
+| `POST /api/workouts/upload/` | 인증 | 운동 메타데이터 + GPS·심박 JSON 파일 한 건 멱등 업로드 |
+| `GET /api/workouts/` | 인증 | 변경된 내 운동을 고정 스냅샷에서 20건씩 다운로드 |
+| `GET /api/workouts/<id>/detail/` | 인증 | 소유권 확인 후 GPS·심박 원본의 5분 다운로드 URL 반환 |
+| `GET /api/workouts/<id>/h3/` | 인증 | 소유권 확인 후 현재 H3 구간·육각형 경계 반환 |
+
+운동 목록은 `since`, `snapshot`, `cursor`를 사용한다. 정렬 기준은
+`(updatedAt DESC, id DESC)`이며 커서는 서버가 발급한 불투명 문자열이다. 앱은 첫
+페이지의 `serverTime`을 다음 페이지의 `snapshot`으로 유지하고, 마지막 페이지까지
+저장한 뒤에만 다음 동기화의 `since`로 기록한다.
+
+상세 API는 원본 JSON이나 객체 path만 반환하지 않는다. 환경별 객체 저장소/CDN 주소와
+서명이 포함된 완성된 `downloadUrl`, `expiresInSeconds`, `contentHash`, `fileSize`를
+반환한다. 앱은 저장소 인증키나 base URL을 갖지 않고 URL에서 파일을 직접 다운로드한다.
 
 **로그인은 이 둘뿐이다. 별도의 회원가입 API 도, 기기 정보 API 도 없다.**
 
@@ -202,11 +238,10 @@ createdAt  lastLoginAt
 
 ### 주요 미결정 사항
 
-1. 좌표 단순화 알고리즘 · 허용 오차
-2. 하이파이브 정밀 판정 방식
-3. 데이터 변환기 필드 매핑 (실제 데이터 확인 후)
-4. 지역 코드 체계 — 법정동 vs 행정동
-5. 지원 데이터 소스 확정 범위
+1. 지도용 좌표 단순화 알고리즘 · 허용 오차
+2. H3 Resolution 11 최종 확정과 최소 시간 겹침
+3. H3 단계의 PostgreSQL 인덱스와 비동기 처리 방식
+4. 원본 GPS·심박 파일 포맷의 향후 버전 전략
 
 ## 파일 작성 규칙
 

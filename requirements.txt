@@ -5,5 +5,7 @@ djangorestframework==3.18.0
 djangorestframework_simplejwt==5.5.1
 PyJWT==2.13.0
 python-dotenv==1.2.3
+psycopg[binary]==3.3.4
 sqlparse==0.6.0
 django-storages[s3]==1.14.6
+h3==4.5.0
