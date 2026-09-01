@@ -86,27 +86,6 @@ class Migration(migrations.Migration):
                 ('workout', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='detail', to='workout_manager.workout')),
             ],
         ),
-        migrations.CreateModel(
-            name='HighFive',
-            fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('h3Cell', models.CharField(max_length=32)),
-                ('overlapStartedAt', models.DateTimeField()),
-                ('overlapEndedAt', models.DateTimeField()),
-                ('createdAt', models.DateTimeField(auto_now_add=True)),
-                ('indexVersion', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='highFives', to='workout_manager.spatialindexversion')),
-                ('segmentA', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsA', to='workout_manager.trajectorysegment')),
-                ('segmentB', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsB', to='workout_manager.trajectorysegment')),
-                ('userA', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsA', to=settings.AUTH_USER_MODEL)),
-                ('userB', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsB', to=settings.AUTH_USER_MODEL)),
-                ('workoutA', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsA', to='workout_manager.workout')),
-                ('workoutB', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsB', to='workout_manager.workout')),
-            ],
-            options={
-                'indexes': [models.Index(fields=['workoutA', 'indexVersion'], name='workout_man_workout_d86941_idx'), models.Index(fields=['workoutB', 'indexVersion'], name='workout_man_workout_d3400c_idx')],
-                'constraints': [models.UniqueConstraint(fields=('workoutA', 'workoutB', 'indexVersion'), name='unique_workout_pair_high_five'), models.CheckConstraint(condition=models.Q(('workoutA__lt', models.F('workoutB'))), name='high_five_ordered_workout_pair'), models.CheckConstraint(condition=models.Q(('overlapStartedAt__lt', models.F('overlapEndedAt'))), name='high_five_positive_overlap')],
-            },
-        ),
         migrations.AddIndex(
             model_name='workout',
             index=models.Index(fields=['user', 'updatedAt', 'id'], name='workout_man_user_id_96ec45_idx'),

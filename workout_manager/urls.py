@@ -16,6 +16,11 @@ urlpatterns = [
     ),
     path('workouts/', views.download_workouts, name='workout-download'),
     path(
+        'workouts/high-fives/',
+        views.download_workout_high_fives,
+        name='workout-high-fives',
+    ),
+    path(
         'workouts/<int:workout_id>/detail/',
         views.download_workout_detail,
         name='workout-detail',

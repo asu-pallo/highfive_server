@@ -3,6 +3,7 @@ import json
 import base64
 import binascii
 import logging
+from datetime import timedelta
 from urllib.parse import urlparse
 
 import boto3
@@ -18,13 +19,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import (
-    HighFive,
-    TrajectorySegment,
-    Workout,
-    WorkoutDetail,
-)
-from .high_five import clear_high_fives, high_five_summaries, rebuild_high_fives
+from .models import TrajectorySegment, Workout, WorkoutDetail
+from .high_five import high_five_summaries
 from .serializers import (
     WorkoutSerializer,
     WorkoutUploadPrepareSerializer,
@@ -35,6 +31,7 @@ from .spatial_index import ensure_h3_segments, rebuild_h3_segments
 
 _workout_page_size = 10
 _logger = logging.getLogger(__name__)
+_route_time_tolerance = timedelta(minutes=1)
 
 
 @api_view(['POST'])
@@ -134,6 +131,7 @@ def create_workout(request):
         detail_error = _validate_detail(detail_json, data)
         if detail_error:
             raise ValueError(detail_error)
+        _clamp_route_to_workout(detail_json['route'], data['startAt'], data['endAt'])
         result = _persist_direct_upload(
             request,
             data,
@@ -258,27 +256,10 @@ def _persist_direct_upload(
     }
     old_keys = set()
     detail_unchanged = False
-    previously_affected_ids = set()
-    previous_relation_keys = set()
     with transaction.atomic():
         defaults = {field: data.get(field) for field in mutable_fields}
         defaults.update(heart_summary)
         workout, created = Workout.objects.get_or_create(**identity, defaults=defaults)
-        if not created:
-            previous_relations = HighFive.objects.filter(
-                Q(workoutA=workout) | Q(workoutB=workout)
-            ).values_list(
-                'workoutA_id',
-                'workoutB_id',
-                'indexVersion_id',
-                'h3Cell',
-                'overlapStartedAt',
-                'overlapEndedAt',
-            )
-            for relation in previous_relations:
-                workout_a_id, workout_b_id = relation[:2]
-                previously_affected_ids.update((workout_a_id, workout_b_id))
-                previous_relation_keys.add(relation)
         changed = []
         if not created:
             for field, value in defaults.items():
@@ -333,27 +314,11 @@ def _persist_direct_upload(
                 old_key,
             )
             raise
-    # 운동과 H3가 커밋된 뒤 판정해야 동시에 올라온 다른 사용자의 경로도 볼 수 있다.
-    # 판정 실패 시 이미 전송한 객체는 그대로 남아 create 재시도에서 재사용된다.
-    if segment_count == 0:
-        clear_high_fives(
-            workout,
-            previously_affected_ids=previously_affected_ids,
-            had_previous_relations=bool(previous_relation_keys),
-        )
-        high_five_count = 0
-    else:
-        high_five_count = rebuild_high_fives(
-            workout,
-            previously_affected_ids=previously_affected_ids,
-            previous_relation_keys=previous_relation_keys,
-        )
     return {
         'serverId': workout.id,
         'created': created,
         'unchanged': detail_unchanged and not created and not changed,
         'trajectorySegmentCount': segment_count,
-        'highFiveCount': high_five_count,
     }
 
 
@@ -416,14 +381,16 @@ def _validate_detail(detail, metadata):
         return 'heartRate는 배열이어야 합니다.'
     try:
         previous_timestamp = None
+        allowed_start = metadata['startAt'] - _route_time_tolerance
+        allowed_end = metadata['endAt'] + _route_time_tolerance
         for point in detail['route']:
             timestamp = parse_datetime(str(point['timestamp']))
             latitude = float(point['latitude'])
             longitude = float(point['longitude'])
             if timestamp is None or timezone.is_naive(timestamp):
                 return '경로 좌표 시각 형식이 올바르지 않습니다.'
-            if not metadata['startAt'] <= timestamp <= metadata['endAt']:
-                return '경로 좌표 시각이 운동 시간 범위를 벗어났습니다.'
+            if not allowed_start <= timestamp <= allowed_end:
+                return '경로 좌표 시각이 운동 시간 허용 범위를 벗어났습니다.'
             if previous_timestamp is not None and timestamp < previous_timestamp:
                 return '경로 좌표 시각은 오름차순이어야 합니다.'
             if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
@@ -436,6 +403,16 @@ def _validate_detail(detail, metadata):
     except (KeyError, TypeError, ValueError):
         return '운동 상세 샘플 형식이 올바르지 않습니다.'
     return None
+
+
+def _clamp_route_to_workout(route, started_at, ended_at):
+    """허용한 HealthKit 경계 오차가 H3 체류 시간으로 번지지 않게 잘라낸다."""
+    for point in route:
+        timestamp = parse_datetime(str(point['timestamp']))
+        if timestamp < started_at:
+            point['timestamp'] = started_at.isoformat()
+        elif timestamp > ended_at:
+            point['timestamp'] = ended_at.isoformat()
 
 
 @api_view(['GET'])
@@ -493,17 +470,46 @@ def download_workouts(request):
         }, separators=(',', ':')).encode()
         next_cursor = base64.urlsafe_b64encode(payload).decode().rstrip('=')
 
-    serialized = WorkoutSerializer(page, many=True).data
-    summaries = high_five_summaries([workout.id for workout in page])
-    for workout, item in zip(page, serialized):
-        item['highFives'] = summaries[workout.id]
-
     return Response({
         's': True,
         'serverTime': snapshot_at,
-        'workouts': serialized,
+        'workouts': WorkoutSerializer(page, many=True).data,
         'nextCursor': next_cursor,
         'hasMore': has_more,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def download_workout_high_fives(request):
+    """현재 피드 페이지에 표시할 내 운동 최대 10건을 실시간 판정한다."""
+    raw_ids = request.data.get('workoutIds')
+    if not isinstance(raw_ids, list):
+        return _fail('workoutIds는 운동 ID 목록이어야 합니다.')
+    try:
+        workout_ids = list(dict.fromkeys(int(value) for value in raw_ids))
+    except (TypeError, ValueError):
+        return _fail('workoutIds 형식이 올바르지 않습니다.')
+    if not workout_ids or len(workout_ids) > _workout_page_size:
+        return _fail(f'운동은 1~{_workout_page_size}건까지 조회할 수 있습니다.')
+
+    owned_ids = list(
+        Workout.objects.filter(
+            id__in=workout_ids,
+            user=request.user,
+            deletedAt__isnull=True,
+        ).values_list('id', flat=True)
+    )
+    if len(owned_ids) != len(workout_ids):
+        return _fail('조회할 수 없는 운동이 포함되어 있습니다.', status.HTTP_404_NOT_FOUND)
+
+    summaries = high_five_summaries(owned_ids)
+    return Response({
+        's': True,
+        'summaries': [
+            {'serverId': workout_id, **summaries[workout_id]}
+            for workout_id in workout_ids
+        ],
     })
 
 

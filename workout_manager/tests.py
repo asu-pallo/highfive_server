@@ -16,9 +16,8 @@ from django.test import TransactionTestCase, override_settings
 from rest_framework_simplejwt.tokens import RefreshToken
 from psycopg.types.range import Range
 
-from .high_five import clear_high_fives, high_five_summaries, rebuild_high_fives
+from .high_five import high_five_summaries
 from .models import (
-    HighFive,
     SpatialIndexVersion,
     TrajectorySegment,
     Workout,
@@ -30,6 +29,7 @@ from .views import _workout_page_size
 UPLOAD_PREPARE = '/api/workouts/upload/prepare/'
 UPLOAD_CREATE = '/api/workouts/upload/create/'
 DOWNLOAD = '/api/workouts/'
+HIGH_FIVES = '/api/workouts/high-fives/'
 
 
 def _workout(workout_id='health-1', **overrides):
@@ -150,10 +150,7 @@ class WorkoutApiTest(APITestCase):
             r'^[0-9a-f]{64}$',
         )
         self.assertNotIn('route', downloaded.data['workouts'][0])
-        self.assertEqual(
-            downloaded.data['workouts'][0]['highFives'],
-            {'totalCount': 0, 'areas': []},
-        )
+        self.assertNotIn('highFives', downloaded.data['workouts'][0])
 
         server_id = downloaded.data['workouts'][0]['serverId']
         detail = self.client.get(f'/api/workouts/{server_id}/detail/')
@@ -222,6 +219,29 @@ class WorkoutApiTest(APITestCase):
         self.assertEqual(len(h3_response.data['segments']), len(segments))
         self.assertEqual(len(h3_response.data['segments'][0]['boundary']), 6)
 
+    def test_iOS_경로의_1분_이내_시간_오차를_허용하고_운동_경계로_자른다(self):
+        metadata = _workout()
+        ended_at = datetime.fromisoformat(metadata['endAt'])
+        response = _direct_upload(
+            self.client,
+            _upload_payload(detail_overrides={'route': [
+                {
+                    'timestamp': metadata['startAt'],
+                    'latitude': 37.5,
+                    'longitude': 127.0,
+                },
+                {
+                    'timestamp': (ended_at + timedelta(seconds=59)).isoformat(),
+                    'latitude': 37.501,
+                    'longitude': 127.001,
+                },
+            ]}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        last_segment = TrajectorySegment.objects.order_by('sequence').last()
+        self.assertEqual(last_segment.period.upper, ended_at)
+
     def test_다른_사용자의_h3_구간은_받지_못한다(self):
         _direct_upload(self.client, _upload_payload())
         workout_id = Workout.objects.get().pk
@@ -251,7 +271,7 @@ class WorkoutApiTest(APITestCase):
         self.assertTrue(replaced_ids)
         self.assertTrue(original_ids.isdisjoint(replaced_ids))
 
-    def test_같은_h3와_겹치는_시간이면_하이파이브를_저장한다(self):
+    def test_같은_h3와_겹치는_시간이면_조회할_때_하이파이브를_계산한다(self):
         start = datetime(2026, 8, 28, 1, tzinfo=dt_timezone.utc)
         version = SpatialIndexVersion.objects.create(
             indexType='h3',
@@ -270,7 +290,7 @@ class WorkoutApiTest(APITestCase):
             exited_at=start + timedelta(minutes=20),
         )
         source_workout = self._create_workout(self.user, 'source-run', start, 30)
-        source_segment = self._create_segment(
+        self._create_segment(
             source_workout,
             version,
             sequence=0,
@@ -279,22 +299,12 @@ class WorkoutApiTest(APITestCase):
             exited_at=start + timedelta(minutes=30),
         )
 
-        count = rebuild_high_fives(source_workout)
+        summary = high_five_summaries([source_workout.id])[source_workout.id]
 
-        self.assertEqual(count, 1)
-        high_five = HighFive.objects.get()
-        self.assertEqual(
-            {high_five.workoutA_id, high_five.workoutB_id},
-            {source_workout.id, other_workout.id},
-        )
-        self.assertIn(
-            source_segment.id,
-            {high_five.segmentA_id, high_five.segmentB_id},
-        )
-        self.assertEqual(high_five.overlapStartedAt, start + timedelta(minutes=5))
-        self.assertEqual(high_five.overlapEndedAt, start + timedelta(minutes=20))
+        self.assertEqual(summary['totalCount'], 1)
+        self.assertEqual(summary['areas'], [{'h3Cell': 'test-cell', 'count': 1}])
 
-    def test_운동_업로드_완료에서_하이파이브까지_판정한다(self):
+    def test_운동_업로드는_판정하지_않고_피드에서_실시간_판정한다(self):
         other = User.objects.create_user(username='upload-high-five-other')
         other_access = RefreshToken.for_user(other).access_token
         other_client = APIClient()
@@ -310,21 +320,26 @@ class WorkoutApiTest(APITestCase):
         )
 
         self.assertEqual(other_response.status_code, 200)
-        self.assertEqual(other_response.data['highFiveCount'], 0)
         self.assertEqual(source_response.status_code, 200)
-        self.assertEqual(source_response.data['highFiveCount'], 1)
-        self.assertEqual(HighFive.objects.count(), 1)
+        self.assertNotIn('highFiveCount', other_response.data)
+        self.assertNotIn('highFiveCount', source_response.data)
 
-        source_feed = self.client.get(DOWNLOAD)
-        other_feed = other_client.get(DOWNLOAD)
-        self.assertEqual(
-            source_feed.data['workouts'][0]['highFives']['totalCount'], 1
+        source_id = Workout.objects.get(user=self.user).id
+        other_id = Workout.objects.get(user=other).id
+        source_feed = self.client.post(
+            HIGH_FIVES, {'workoutIds': [source_id]}, format='json'
+        )
+        other_feed = other_client.post(
+            HIGH_FIVES, {'workoutIds': [other_id]}, format='json'
         )
         self.assertEqual(
-            other_feed.data['workouts'][0]['highFives']['totalCount'], 1
+            source_feed.data['summaries'][0]['totalCount'], 1
+        )
+        self.assertEqual(
+            other_feed.data['summaries'][0]['totalCount'], 1
         )
 
-    def test_같은_상대의_여러_겹침에서_가장_긴_하나만_저장한다(self):
+    def test_같은_상대의_여러_겹침은_한명으로_계산한다(self):
         start = datetime(2026, 8, 28, 1, tzinfo=dt_timezone.utc)
         version = SpatialIndexVersion.objects.create(
             indexType='h3',
@@ -361,10 +376,6 @@ class WorkoutApiTest(APITestCase):
             exited_at=start + timedelta(minutes=30),
         )
 
-        rebuild_high_fives(source_workout)
-        rebuild_high_fives(source_workout)
-
-        self.assertEqual(HighFive.objects.count(), 2)
         summary = high_five_summaries([source_workout.id])[source_workout.id]
         self.assertEqual(summary['totalCount'], 1)
         self.assertEqual(summary['areas'], [{'h3Cell': 'test-cell', 'count': 1}])
@@ -398,12 +409,11 @@ class WorkoutApiTest(APITestCase):
             exited_at=boundary + timedelta(minutes=10),
         )
 
-        count = rebuild_high_fives(source_workout)
+        summary = high_five_summaries([source_workout.id])[source_workout.id]
 
-        self.assertEqual(count, 0)
-        self.assertFalse(HighFive.objects.exists())
+        self.assertEqual(summary, {'totalCount': 0, 'areas': []})
 
-    def test_유효한_h3_경로가_사라지면_기존_하이파이브를_정리한다(self):
+    def test_같은_사용자의_겹치는_운동은_하이파이브가_아니다(self):
         start = datetime(2026, 8, 28, 1, tzinfo=dt_timezone.utc)
         version = SpatialIndexVersion.objects.create(
             indexType='h3',
@@ -411,8 +421,7 @@ class WorkoutApiTest(APITestCase):
             parameters={'resolution': 11},
             isActive=True,
         )
-        other = User.objects.create_user(username='route-removed-other')
-        other_workout = self._create_workout(other, 'other-run', start, 30)
+        other_workout = self._create_workout(self.user, 'other-run', start, 30)
         self._create_segment(
             other_workout,
             version,
@@ -430,12 +439,6 @@ class WorkoutApiTest(APITestCase):
             entered_at=start,
             exited_at=start + timedelta(minutes=30),
         )
-        rebuild_high_fives(source_workout)
-        self.assertEqual(HighFive.objects.count(), 1)
-
-        clear_high_fives(source_workout)
-
-        self.assertFalse(HighFive.objects.exists())
         self.assertEqual(
             high_five_summaries([source_workout.id])[source_workout.id],
             {'totalCount': 0, 'areas': []},
@@ -538,7 +541,7 @@ class WorkoutApiTest(APITestCase):
 
         self.assertEqual([item['id'] for item in response.data['workouts']], ['new'])
 
-    def test_운동_목록은_20개씩_커서_페이징한다(self):
+    def test_운동_목록은_10개씩_커서_페이징한다(self):
         start = timezone.now() - timedelta(days=30)
         Workout.objects.bulk_create([
             Workout(
