@@ -1,7 +1,6 @@
 from django.contrib.auth.models import User
 from django.contrib.postgres.fields import DateTimeRangeField
 from django.db import models
-import uuid
 
 
 class Workout(models.Model):
@@ -41,67 +40,26 @@ class Workout(models.Model):
 
 
 class WorkoutDetail(models.Model):
-    """지도 경로·심박 원본 JSON 파일의 객체 저장소 메타데이터."""
+    """경로·심박 원본 파일을 각각 가리키는 객체 저장소 메타데이터."""
 
     workout = models.OneToOneField(
         Workout, on_delete=models.CASCADE, related_name='detail'
     )
-    objectKey = models.CharField(max_length=700, unique=True)
+    routeObjectKey = models.CharField(max_length=700, null=True, blank=True, unique=True)
+    routeContentHash = models.CharField(max_length=64, blank=True, default='')
+    routeFileSize = models.PositiveBigIntegerField(default=0)
+    heartRateObjectKey = models.CharField(
+        max_length=700, null=True, blank=True, unique=True
+    )
+    heartRateContentHash = models.CharField(max_length=64, blank=True, default='')
+    heartRateFileSize = models.PositiveBigIntegerField(default=0)
+    # 두 파일 해시를 합친 앱 캐시 비교용 해시다.
     contentHash = models.CharField(max_length=64)
     formatVersion = models.PositiveSmallIntegerField(default=1)
     routePointCount = models.PositiveIntegerField(default=0)
     heartRateSampleCount = models.PositiveIntegerField(default=0)
     fileSize = models.PositiveBigIntegerField(default=0)
     updatedAt = models.DateTimeField(auto_now=True)
-
-
-class WorkoutUploadSession(models.Model):
-    """클라이언트가 객체 저장소에 직접 올리는 운동 상세 파일의 처리 상태."""
-
-    class Status(models.TextChoices):
-        PREPARED = 'prepared'
-        PROCESSING = 'processing'
-        READY = 'ready'
-        FAILED = 'failed'
-
-    uploadId = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(
-        User, on_delete=models.CASCADE, related_name='workoutUploadSessions'
-    )
-    source = models.CharField(max_length=30)
-    sourceName = models.CharField(max_length=255)
-    sourceWorkoutId = models.CharField(max_length=255)
-    metadata = models.JSONField()
-    objectKey = models.CharField(max_length=700)
-    contentHash = models.CharField(max_length=64)
-    fileSize = models.PositiveBigIntegerField()
-    status = models.CharField(
-        max_length=20, choices=Status.choices, default=Status.PREPARED, db_index=True
-    )
-    workout = models.ForeignKey(
-        Workout,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='uploadSessions',
-    )
-    expiresAt = models.DateTimeField(db_index=True)
-    createdAt = models.DateTimeField(auto_now_add=True)
-    updatedAt = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=(
-                    'user',
-                    'source',
-                    'sourceName',
-                    'sourceWorkoutId',
-                    'contentHash',
-                ),
-                name='unique_workout_upload_content',
-            ),
-        ]
 
 
 class SpatialIndexVersion(models.Model):
@@ -156,4 +114,60 @@ class TrajectorySegment(models.Model):
         indexes = [
             models.Index(fields=('workout', 'indexVersion', 'sequence')),
             models.Index(fields=('indexVersion', 'cellId')),
+        ]
+
+
+class HighFive(models.Model):
+    """두 운동 사이에 성립한 대칭적인 하이파이브 관계."""
+
+    workoutA = models.ForeignKey(
+        Workout, on_delete=models.CASCADE, related_name='highFivesAsA'
+    )
+    workoutB = models.ForeignKey(
+        Workout, on_delete=models.CASCADE, related_name='highFivesAsB'
+    )
+    userA = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='highFivesAsA'
+    )
+    userB = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='highFivesAsB'
+    )
+    indexVersion = models.ForeignKey(
+        SpatialIndexVersion,
+        on_delete=models.PROTECT,
+        related_name='highFives',
+    )
+    h3Cell = models.CharField(max_length=32)
+    overlapStartedAt = models.DateTimeField()
+    overlapEndedAt = models.DateTimeField()
+    segmentA = models.ForeignKey(
+        TrajectorySegment,
+        on_delete=models.CASCADE,
+        related_name='highFivesAsA',
+    )
+    segmentB = models.ForeignKey(
+        TrajectorySegment,
+        on_delete=models.CASCADE,
+        related_name='highFivesAsB',
+    )
+    createdAt = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=('workoutA', 'workoutB', 'indexVersion'),
+                name='unique_workout_pair_high_five',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(workoutA__lt=models.F('workoutB')),
+                name='high_five_ordered_workout_pair',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(overlapStartedAt__lt=models.F('overlapEndedAt')),
+                name='high_five_positive_overlap',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('workoutA', 'indexVersion')),
+            models.Index(fields=('workoutB', 'indexVersion')),
         ]

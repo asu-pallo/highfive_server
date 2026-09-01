@@ -14,18 +14,21 @@ from rest_framework.test import APITestCase
 from rest_framework.test import APIClient
 from django.test import TransactionTestCase, override_settings
 from rest_framework_simplejwt.tokens import RefreshToken
+from psycopg.types.range import Range
 
+from .high_five import clear_high_fives, high_five_summaries, rebuild_high_fives
 from .models import (
+    HighFive,
     SpatialIndexVersion,
     TrajectorySegment,
     Workout,
-    WorkoutUploadSession,
+    WorkoutDetail,
 )
 from .views import _workout_page_size
 
 
 UPLOAD_PREPARE = '/api/workouts/upload/prepare/'
-UPLOAD_COMPLETE = '/api/workouts/upload/complete/'
+UPLOAD_CREATE = '/api/workouts/upload/create/'
 DOWNLOAD = '/api/workouts/'
 
 
@@ -67,7 +70,6 @@ def _upload_payload(workout_id='health-1', metadata_overrides=None, detail_overr
     }
     detail.update(detail_overrides or {})
     content = json.dumps(detail, separators=(',', ':')).encode()
-    metadata['contentHash'] = hashlib.sha256(content).hexdigest()
     return {
         'metadata': json.dumps(metadata),
         'detail': SimpleUploadedFile('detail.json', content, content_type='application/json'),
@@ -76,19 +78,43 @@ def _upload_payload(workout_id='health-1', metadata_overrides=None, detail_overr
 
 def _direct_upload(client, payload):
     metadata = json.loads(payload['metadata'])
-    content = payload['detail'].read()
-    metadata['fileSize'] = len(content)
+    detail = json.loads(payload['detail'].read())
+    identity = {key: detail[key] for key in (
+        'formatVersion', 'source', 'sourceName', 'sourceWorkoutId',
+        'startedAt', 'endedAt',
+    )}
+    route_content = _detail_content(identity, 'route', detail['route'])
+    heart_content = _detail_content(identity, 'heartRate', detail['heartRate'])
+    route_hash = hashlib.sha256(route_content).hexdigest() if route_content else ''
+    heart_hash = hashlib.sha256(heart_content).hexdigest() if heart_content else ''
+    metadata.update({
+        'routeContentHash': route_hash,
+        'routeFileSize': len(route_content),
+        'heartRateContentHash': heart_hash,
+        'heartRateFileSize': len(heart_content),
+        'detailContentHash': hashlib.sha256(
+            f'{route_hash}:{heart_hash}'.encode()
+        ).hexdigest(),
+    })
     prepared = client.post(UPLOAD_PREPARE, metadata, format='json')
     if prepared.status_code != 200:
         return prepared
-    session = WorkoutUploadSession.objects.get(uploadId=prepared.data['uploadId'])
-    if prepared.data['detailUploadRequired']:
-        default_storage.save(session.objectKey, ContentFile(content))
-    return client.post(
-        UPLOAD_COMPLETE,
-        {'uploadId': str(session.uploadId)},
-        format='json',
-    )
+    for response_key, content in (
+        ('routeUpload', route_content),
+        ('heartRateUpload', heart_content),
+    ):
+        target = prepared.data[response_key]
+        if target['uploadRequired']:
+            default_storage.save(target['uploadFields']['key'], ContentFile(content))
+    return client.post(UPLOAD_CREATE, metadata, format='json')
+
+
+def _detail_content(identity, key, samples):
+    if not samples:
+        return b''
+    return json.dumps(
+        {**identity, key: samples}, separators=(',', ':')
+    ).encode()
 
 
 @override_settings(
@@ -124,62 +150,36 @@ class WorkoutApiTest(APITestCase):
             r'^[0-9a-f]{64}$',
         )
         self.assertNotIn('route', downloaded.data['workouts'][0])
+        self.assertEqual(
+            downloaded.data['workouts'][0]['highFives'],
+            {'totalCount': 0, 'areas': []},
+        )
 
         server_id = downloaded.data['workouts'][0]['serverId']
         detail = self.client.get(f'/api/workouts/{server_id}/detail/')
         self.assertEqual(detail.status_code, 200)
-        self.assertIn('downloadUrl', detail.data)
+        self.assertIn('routeDownloadUrl', detail.data)
+        self.assertIn('heartRateDownloadUrl', detail.data)
         self.assertNotIn('detail', detail.data)
         self.assertEqual(detail.data['expiresInSeconds'], 300)
 
-    def test_S3_직접_업로드를_준비하고_완료한다(self):
+    def test_S3_직접_업로드를_준비하고_생성한다(self):
         payload = _upload_payload()
-        metadata = json.loads(payload['metadata'])
-        content = payload['detail'].read()
-        metadata['fileSize'] = len(content)
-        with self.settings(
-            S3_BUCKET_NAME='test-bucket',
-            S3_PUBLIC_ENDPOINT_URL='http://127.0.0.1:9000',
-            S3_ACCESS_KEY='test',
-            S3_SECRET_KEY='test',
-        ):
-            prepared = self.client.post(UPLOAD_PREPARE, metadata, format='json')
+        created = _direct_upload(self.client, payload)
 
-        self.assertEqual(prepared.status_code, 200)
-        self.assertTrue(prepared.data['detailUploadRequired'])
-        self.assertIn('uploadUrl', prepared.data)
-        session = WorkoutUploadSession.objects.get(
-            uploadId=prepared.data['uploadId']
-        )
-        default_storage.save(session.objectKey, ContentFile(content))
-
-        completed = self.client.post(
-            UPLOAD_COMPLETE,
-            {'uploadId': str(session.uploadId)},
-            format='json',
-        )
-
-        self.assertEqual(completed.status_code, 200)
-        self.assertEqual(completed.data['trajectorySegmentCount'], 1)
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.data['trajectorySegmentCount'], 1)
         self.assertEqual(Workout.objects.count(), 1)
-        session.refresh_from_db()
-        self.assertEqual(session.status, WorkoutUploadSession.Status.READY)
+        detail = WorkoutDetail.objects.get()
+        self.assertIn('/route/', detail.routeObjectKey)
+        self.assertIn('/heart-rate/', detail.heartRateObjectKey)
+        self.assertNotEqual(detail.routeObjectKey, detail.heartRateObjectKey)
 
-        metadata['distanceMeters'] = 5100
-        prepared_again = self.client.post(
-            UPLOAD_PREPARE,
-            metadata,
-            format='json',
+        created_again = _direct_upload(
+            self.client,
+            _upload_payload(metadata_overrides={'distanceMeters': 5100}),
         )
-        self.assertEqual(prepared_again.status_code, 200)
-        self.assertFalse(prepared_again.data['detailUploadRequired'])
-
-        completed_again = self.client.post(
-            UPLOAD_COMPLETE,
-            {'uploadId': prepared_again.data['uploadId']},
-            format='json',
-        )
-        self.assertEqual(completed_again.status_code, 200)
+        self.assertEqual(created_again.status_code, 200)
         self.assertEqual(Workout.objects.get().distanceMeters, 5100)
 
     def test_원본_경로를_h3_체류_구간으로_저장한다(self):
@@ -250,6 +250,227 @@ class WorkoutApiTest(APITestCase):
         replaced_ids = set(TrajectorySegment.objects.values_list('id', flat=True))
         self.assertTrue(replaced_ids)
         self.assertTrue(original_ids.isdisjoint(replaced_ids))
+
+    def test_같은_h3와_겹치는_시간이면_하이파이브를_저장한다(self):
+        start = datetime(2026, 8, 28, 1, tzinfo=dt_timezone.utc)
+        version = SpatialIndexVersion.objects.create(
+            indexType='h3',
+            algorithmVersion=1,
+            parameters={'resolution': 11},
+            isActive=True,
+        )
+        other = User.objects.create_user(username='high-five-other')
+        other_workout = self._create_workout(other, 'other-run', start, 30)
+        self._create_segment(
+            other_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start + timedelta(minutes=5),
+            exited_at=start + timedelta(minutes=20),
+        )
+        source_workout = self._create_workout(self.user, 'source-run', start, 30)
+        source_segment = self._create_segment(
+            source_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start,
+            exited_at=start + timedelta(minutes=30),
+        )
+
+        count = rebuild_high_fives(source_workout)
+
+        self.assertEqual(count, 1)
+        high_five = HighFive.objects.get()
+        self.assertEqual(
+            {high_five.workoutA_id, high_five.workoutB_id},
+            {source_workout.id, other_workout.id},
+        )
+        self.assertIn(
+            source_segment.id,
+            {high_five.segmentA_id, high_five.segmentB_id},
+        )
+        self.assertEqual(high_five.overlapStartedAt, start + timedelta(minutes=5))
+        self.assertEqual(high_five.overlapEndedAt, start + timedelta(minutes=20))
+
+    def test_운동_업로드_완료에서_하이파이브까지_판정한다(self):
+        other = User.objects.create_user(username='upload-high-five-other')
+        other_access = RefreshToken.for_user(other).access_token
+        other_client = APIClient()
+        other_client.credentials(HTTP_AUTHORIZATION=f'Bearer {other_access}')
+        other_response = _direct_upload(
+            other_client,
+            _upload_payload('other-upload-run'),
+        )
+
+        source_response = _direct_upload(
+            self.client,
+            _upload_payload('source-upload-run'),
+        )
+
+        self.assertEqual(other_response.status_code, 200)
+        self.assertEqual(other_response.data['highFiveCount'], 0)
+        self.assertEqual(source_response.status_code, 200)
+        self.assertEqual(source_response.data['highFiveCount'], 1)
+        self.assertEqual(HighFive.objects.count(), 1)
+
+        source_feed = self.client.get(DOWNLOAD)
+        other_feed = other_client.get(DOWNLOAD)
+        self.assertEqual(
+            source_feed.data['workouts'][0]['highFives']['totalCount'], 1
+        )
+        self.assertEqual(
+            other_feed.data['workouts'][0]['highFives']['totalCount'], 1
+        )
+
+    def test_같은_상대의_여러_겹침에서_가장_긴_하나만_저장한다(self):
+        start = datetime(2026, 8, 28, 1, tzinfo=dt_timezone.utc)
+        version = SpatialIndexVersion.objects.create(
+            indexType='h3',
+            algorithmVersion=1,
+            parameters={'resolution': 11},
+            isActive=True,
+        )
+        other = User.objects.create_user(username='same-high-five-other')
+        short_workout = self._create_workout(other, 'short-run', start, 30)
+        self._create_segment(
+            short_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start + timedelta(minutes=5),
+            exited_at=start + timedelta(minutes=10),
+        )
+        long_workout = self._create_workout(other, 'long-run', start, 30)
+        self._create_segment(
+            long_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start + timedelta(minutes=5),
+            exited_at=start + timedelta(minutes=25),
+        )
+        source_workout = self._create_workout(self.user, 'source-run', start, 30)
+        self._create_segment(
+            source_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start,
+            exited_at=start + timedelta(minutes=30),
+        )
+
+        rebuild_high_fives(source_workout)
+        rebuild_high_fives(source_workout)
+
+        self.assertEqual(HighFive.objects.count(), 2)
+        summary = high_five_summaries([source_workout.id])[source_workout.id]
+        self.assertEqual(summary['totalCount'], 1)
+        self.assertEqual(summary['areas'], [{'h3Cell': 'test-cell', 'count': 1}])
+
+    def test_종료와_시작만_맞닿으면_하이파이브가_아니다(self):
+        start = datetime(2026, 8, 28, 1, tzinfo=dt_timezone.utc)
+        boundary = start + timedelta(minutes=10)
+        version = SpatialIndexVersion.objects.create(
+            indexType='h3',
+            algorithmVersion=1,
+            parameters={'resolution': 11},
+            isActive=True,
+        )
+        other = User.objects.create_user(username='boundary-other')
+        other_workout = self._create_workout(other, 'other-run', start, 10)
+        self._create_segment(
+            other_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start,
+            exited_at=boundary,
+        )
+        source_workout = self._create_workout(self.user, 'source-run', boundary, 10)
+        self._create_segment(
+            source_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=boundary,
+            exited_at=boundary + timedelta(minutes=10),
+        )
+
+        count = rebuild_high_fives(source_workout)
+
+        self.assertEqual(count, 0)
+        self.assertFalse(HighFive.objects.exists())
+
+    def test_유효한_h3_경로가_사라지면_기존_하이파이브를_정리한다(self):
+        start = datetime(2026, 8, 28, 1, tzinfo=dt_timezone.utc)
+        version = SpatialIndexVersion.objects.create(
+            indexType='h3',
+            algorithmVersion=1,
+            parameters={'resolution': 11},
+            isActive=True,
+        )
+        other = User.objects.create_user(username='route-removed-other')
+        other_workout = self._create_workout(other, 'other-run', start, 30)
+        self._create_segment(
+            other_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start,
+            exited_at=start + timedelta(minutes=30),
+        )
+        source_workout = self._create_workout(self.user, 'source-run', start, 30)
+        self._create_segment(
+            source_workout,
+            version,
+            sequence=0,
+            cell='test-cell',
+            entered_at=start,
+            exited_at=start + timedelta(minutes=30),
+        )
+        rebuild_high_fives(source_workout)
+        self.assertEqual(HighFive.objects.count(), 1)
+
+        clear_high_fives(source_workout)
+
+        self.assertFalse(HighFive.objects.exists())
+        self.assertEqual(
+            high_five_summaries([source_workout.id])[source_workout.id],
+            {'totalCount': 0, 'areas': []},
+        )
+
+    @staticmethod
+    def _create_workout(user, workout_id, start, duration_minutes):
+        return Workout.objects.create(
+            user=user,
+            source='healthConnect',
+            sourceName='test.app',
+            sourceWorkoutId=workout_id,
+            kind='running',
+            startAt=start,
+            endAt=start + timedelta(minutes=duration_minutes),
+        )
+
+    @staticmethod
+    def _create_segment(
+        workout,
+        version,
+        *,
+        sequence,
+        cell,
+        entered_at,
+        exited_at,
+    ):
+        return TrajectorySegment.objects.create(
+            workout=workout,
+            user=workout.user,
+            indexVersion=version,
+            sequence=sequence,
+            cellId=cell,
+            period=Range(entered_at, exited_at, bounds='[)'),
+        )
 
     def test_다른_사용자의_상세_파일은_받지_못한다(self):
         _direct_upload(self.client, _upload_payload())

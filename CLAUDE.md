@@ -22,12 +22,13 @@ API 스펙이나 데이터 형식이 궁금하면 **추측하지 말고 앱 코�
 
 ## 현재 상태
 
-**사용자·인증, 운동 원본 동기화와 H3 경로 인덱스 저장까지 되어 있다.** 하이파이브
-판정은 아직 없다.
+**사용자·인증, 운동 원본 동기화, H3 경로 인덱스와 대칭 HighFive 관계 저장까지 되어
+있다.** 피드 10건의 하이파이브를 일괄 집계하고 운동별 요약만 공용 Redis에 캐시한다.
 
 - `user_manager` — Profile 모델 + 소셜/자동 로그인 + 닉네임 API
 - `workout_manager` — 운동별 준비 API + Presigned POST 객체 직접 업로드 + 완료 검증,
-  H3 Resolution 11 연속 체류 구간 저장 + 서버 시각 기반 20건 커서 다운로드와 상세 API
+  H3 Resolution 11 연속 체류 구간 저장 + 대칭 하이파이브 관계 판정 + 서버 시각 기반
+  10건 커서 다운로드와 상세 API
 - 앱 피드는 서버에서 내려받아 Drift에 캐시한 운동만 표시한다
 - DB는 Docker PostgreSQL 17로 전환했다. 객체 저장소는 로컬 MinIO다
 - git 저장소다(앱과 별개). 커밋은 유저가 직접 관리한다
@@ -81,10 +82,11 @@ server/
    ├─ nickname.py     정규화·검증 규칙
    └─ management/commands/runserver.py   # 아래 참고
 └─ workout_manager/ # 운동 저장·상세 파일·증분 동기화
-   ├─ models.py       Workout · WorkoutDetail · SpatialIndexVersion · TrajectorySegment
+   ├─ models.py       Workout · WorkoutDetail · SpatialIndexVersion · TrajectorySegment · HighFive
    ├─ spatial_index.py H3 Resolution 11 변환·통과 셀 보완·구간 저장
+   ├─ high_five.py    동일 H3 셀·시간 겹침 후보 조회와 상대 사용자별 대표 판정
    ├─ serializers.py  업로드 검증·다운로드 응답
-   └─ views.py        prepare/complete upload · download_workouts · detail
+   └─ views.py        stateless prepare/create upload · download_workouts · detail
 ```
 
 > **`runserver` 를 덮어썼다.** 기본이 `127.0.0.1` 이라 실기기가 못 붙고,
@@ -145,8 +147,8 @@ Android 실단말의 MinIO 직접 다운로드는 `.env`의
 | `POST /api/auth/autologin/` | 공개 | **자동 로그인.** refresh 토큰으로 세션을 잇는다 |
 | `POST /api/users/nickname/` | 인증 | 닉네임 설정·변경 |
 | `POST /api/workouts/upload/prepare/` | 인증 | 메타데이터·해시·크기 검증 후 필요한 경우 5분 Presigned POST 폼 발급 |
-| `POST /api/workouts/upload/complete/` | 인증 | S3 객체·해시·JSON 검증 후 운동·상세·H3 확정 |
-| `GET /api/workouts/` | 인증 | 변경된 내 운동을 고정 스냅샷에서 20건씩 다운로드 |
+| `POST /api/workouts/upload/create/` | 인증 | 경로·심박 S3 객체를 각각 검증한 후 운동·상세·H3 생성 및 하이파이브 판정 |
+| `GET /api/workouts/` | 인증 | 변경된 내 운동과 HighFive 요약을 고정 스냅샷에서 10건씩 다운로드 |
 | `GET /api/workouts/<id>/detail/` | 인증 | 소유권 확인 후 GPS·심박 원본의 5분 다운로드 URL 반환 |
 | `GET /api/workouts/<id>/h3/` | 인증 | 소유권 확인 후 현재 H3 구간·육각형 경계 반환 |
 

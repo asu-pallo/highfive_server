@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -192,6 +193,21 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv('WORKOUT_UPLOAD_MAX_BYTES', 25 * 102
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# 운동별 하이파이브 요약만 저장한다. 원본 관계는 PostgreSQL이 보관한다.
+REDIS_URL = os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1')
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': REDIS_URL,
+        'OPTIONS': {'CLIENT_CLASS': 'django_redis.client.DefaultClient'},
+    }
+}
+if 'test' in sys.argv:
+    CACHES['default'] = {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'highfive-tests',
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

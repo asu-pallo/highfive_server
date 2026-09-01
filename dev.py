@@ -16,6 +16,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+from redis import Redis
+from redis.exceptions import RedisError
 
 
 SERVER_DIR = Path(__file__).resolve().parent
@@ -55,6 +57,7 @@ def check_python_dependencies() -> None:
         __import__('django')
         __import__('psycopg')
         __import__('storages')
+        __import__('django_redis')
     except ImportError:
         raise SystemExit(
             '서버 패키지가 부족합니다. '
@@ -88,19 +91,46 @@ def configure_android_minio_reverse() -> None:
     if public_endpoint.hostname not in {'localhost', '127.0.0.1'}:
         return
     try:
+        devices = subprocess.run(
+            ['adb', 'devices'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print('Android adb가 없어 MinIO 포트 전달을 건너뜁니다.')
+        return
+
+    serials = [
+        line.split('\t', 1)[0]
+        for line in devices.stdout.splitlines()[1:]
+        if line.endswith('\tdevice')
+    ]
+    if not serials:
+        print('연결된 Android 단말이 없어 MinIO 포트 전달을 건너뜁니다.')
+        return
+
+    for serial in serials:
         result = subprocess.run(
-            ['adb', 'reverse', 'tcp:9000', 'tcp:9000'],
+            ['adb', '-s', serial, 'reverse', 'tcp:9000', 'tcp:9000'],
             check=False,
             capture_output=True,
             text=True,
         )
-    except FileNotFoundError:
-        print('Android adb가 없어 MinIO 포트 전달을 건너뜁니다.')
-        return
-    if result.returncode == 0:
-        print('Android MinIO 연결: 단말 localhost:9000 → Mac localhost:9000')
-    else:
-        print('연결된 Android 단말이 없어 MinIO 포트 전달을 건너뜁니다.')
+        registered = subprocess.run(
+            ['adb', '-s', serial, 'reverse', '--list'],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and 'tcp:9000 tcp:9000' in registered.stdout:
+            print(
+                f'Android MinIO 연결 완료 · {serial}: '
+                '단말 localhost:9000 → Mac localhost:9000'
+            )
+        else:
+            reason = result.stderr.strip() or registered.stderr.strip() or '등록 확인 실패'
+            print(f'Android MinIO 포트 전달 실패 · {serial}: {reason}')
 
 
 def remove_android_minio_reverse() -> None:
@@ -147,6 +177,22 @@ def wait_for_postgres(timeout_seconds: int = 30) -> None:
     raise SystemExit(f'PostgreSQL이 {timeout_seconds}초 안에 준비되지 않았습니다.')
 
 
+def wait_for_redis(timeout_seconds: int = 30) -> None:
+    client = Redis.from_url(os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'))
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            if client.ping():
+                return
+        except (RedisError, OSError):
+            pass
+        time.sleep(1)
+    raise SystemExit(
+        f'공용 Redis가 {timeout_seconds}초 안에 준비되지 않았습니다. '
+        'pallo-redis가 127.0.0.1:6379에서 실행 중인지 확인하세요.'
+    )
+
+
 def stop_django() -> None:
     if not PID_FILE.exists():
         print('실행 중인 Django 개발 서버가 없습니다.')
@@ -168,23 +214,28 @@ def up() -> None:
     check_docker()
     RUN_DIR.mkdir(exist_ok=True)
 
-    print('[1/5] Docker 개발 서비스를 시작합니다.')
+    print('[1/6] Docker 개발 서비스를 시작합니다.')
     compose('up', '-d')
-    configure_android_minio_reverse()
     try:
-        print('[2/5] PostgreSQL 준비를 확인합니다.')
+        print('[2/6] PostgreSQL 준비를 확인합니다.')
         wait_for_postgres()
 
-        print('[3/5] MinIO 준비와 비공개 버킷을 확인합니다.')
+        print('[3/6] Redis 준비를 확인합니다.')
+        wait_for_redis()
+
+        print('[4/6] MinIO 준비와 비공개 버킷을 확인합니다.')
         wait_for_minio()
         compose('run', '--rm', 'minio-init')
 
-        print('[4/5] Django 마이그레이션을 적용합니다.')
+        print('[5/6] Django 마이그레이션을 적용합니다.')
         run([sys.executable, str(MANAGE_PY), 'migrate'])
+
+        # reset/up 준비 도중 무선 adb가 재연결될 수 있으므로 모든 준비가 끝난 뒤 설정한다.
+        configure_android_minio_reverse()
 
         host = os.getenv('DEV_SERVER_HOST', '0.0.0.0')
         port = os.getenv('DEV_SERVER_PORT', '8000')
-        print(f'[5/5] Django를 시작합니다: http://{host}:{port}')
+        print(f'[6/6] Django를 시작합니다: http://{host}:{port}')
         print('종료하려면 Ctrl+C를 누르세요. Django 로그는 아래에 바로 출력됩니다.')
 
         process = subprocess.Popen(
@@ -295,7 +346,14 @@ def reset() -> None:
 
     print('빈 DB에 마이그레이션을 적용합니다.')
     run([sys.executable, str(MANAGE_PY), 'migrate'])
-    print('로컬 PostgreSQL과 MinIO 파일 초기화가 완료됐습니다.')
+    wait_for_redis()
+    redis_client = Redis.from_url(
+        os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1')
+    )
+    keys = list(redis_client.scan_iter(match='*highfive:*'))
+    if keys:
+        redis_client.delete(*keys)
+    print('로컬 PostgreSQL, MinIO 파일과 Redis 캐시 초기화가 완료됐습니다.')
 
 
 def reset_local_object_storage() -> None:

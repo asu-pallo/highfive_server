@@ -3,7 +3,7 @@ import json
 import base64
 import binascii
 import logging
-from datetime import timedelta
+from urllib.parse import urlparse
 
 import boto3
 import h3
@@ -19,28 +19,28 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import (
+    HighFive,
     TrajectorySegment,
     Workout,
     WorkoutDetail,
-    WorkoutUploadSession,
 )
+from .high_five import clear_high_fives, high_five_summaries, rebuild_high_fives
 from .serializers import (
     WorkoutSerializer,
-    WorkoutUploadCompleteSerializer,
     WorkoutUploadPrepareSerializer,
     WorkoutUploadSerializer,
 )
 from .spatial_index import ensure_h3_segments, rebuild_h3_segments
 
 
-_workout_page_size = 20
+_workout_page_size = 10
 _logger = logging.getLogger(__name__)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def prepare_workout_upload(request):
-    """운동 메타데이터를 검증하고 상세 JSON의 S3 직접 업로드 폼을 발급한다."""
+    """DB 상태를 만들지 않고 경로·심박 파일의 S3 업로드 폼을 발급한다."""
     body = WorkoutUploadPrepareSerializer(data=request.data)
     if not body.is_valid():
         return _upload_fail(
@@ -51,43 +51,26 @@ def prepare_workout_upload(request):
             diagnostic=body.errors,
         )
     data = body.validated_data
-    if data['fileSize'] > settings.DATA_UPLOAD_MAX_MEMORY_SIZE:
-        return _upload_fail(
-            request,
-            '운동 상세 파일이 허용 크기를 초과했습니다.',
-            stage='prepare_file_size',
-            code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            metadata=data,
-        )
+    for label, size in (
+        ('경로', data['routeFileSize']),
+        ('심박수', data['heartRateFileSize']),
+    ):
+        if size > settings.DATA_UPLOAD_MAX_MEMORY_SIZE:
+            return _upload_fail(
+                request,
+                f'{label} 파일이 허용 크기를 초과했습니다.',
+                stage='prepare_file_size',
+                code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                metadata=data,
+            )
 
-    identity = {
-        'user': request.user,
-        'source': data['source'],
-        'sourceName': data['sourceName'],
-        'sourceWorkoutId': data['sourceWorkoutId'],
-    }
-    object_key = f"workouts/{request.user.id}/{data['contentHash']}.json"
-    expires_at = timezone.now() + timedelta(
-        seconds=settings.S3_DOWNLOAD_EXPIRES_SECONDS
-    )
-    metadata = _session_metadata(data)
-    session, _ = WorkoutUploadSession.objects.update_or_create(
-        **identity,
-        contentHash=data['contentHash'],
-        defaults={
-            'metadata': metadata,
-            'objectKey': object_key,
-            'fileSize': data['fileSize'],
-            'status': WorkoutUploadSession.Status.PREPARED,
-            'expiresAt': expires_at,
-        },
-    )
+    keys = _detail_object_keys(request.user.id, data)
     try:
-        detail_upload_required = not default_storage.exists(object_key)
-        upload = (
-            _workout_upload_form(object_key, data['fileSize'])
-            if detail_upload_required
-            else None
+        route_upload = _prepare_file_upload(
+            request, keys['route'], data['routeFileSize']
+        )
+        heart_rate_upload = _prepare_file_upload(
+            request, keys['heartRate'], data['heartRateFileSize']
         )
     except Exception:
         _logger.exception(
@@ -102,74 +85,52 @@ def prepare_workout_upload(request):
 
     return Response({
         's': True,
-        'uploadId': session.uploadId,
-        'detailUploadRequired': detail_upload_required,
-        'uploadUrl': upload['url'] if upload else None,
-        'uploadFields': upload['fields'] if upload else {},
+        'routeUpload': route_upload,
+        'heartRateUpload': heart_rate_upload,
         'expiresInSeconds': settings.S3_DOWNLOAD_EXPIRES_SECONDS,
     })
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
-def complete_workout_upload(request):
-    """S3 직접 업로드 파일을 검증하고 운동·상세·H3를 확정한다."""
-    body = WorkoutUploadCompleteSerializer(data=request.data)
+def create_workout(request):
+    """업로드된 경로·심박 파일을 검증하고 운동·상세·H3를 생성한다."""
+    body = WorkoutUploadSerializer(data=request.data)
     if not body.is_valid():
         return _upload_fail(
             request,
-            '운동 업로드 완료 정보가 올바르지 않습니다.',
-            stage='complete_metadata',
+            '운동 생성 정보가 올바르지 않습니다.',
+            stage='create_metadata',
+            metadata=request.data,
             diagnostic=body.errors,
         )
-    upload_id = body.validated_data['uploadId']
-    try:
-        session = WorkoutUploadSession.objects.get(
-            uploadId=upload_id,
-            user=request.user,
-        )
-    except WorkoutUploadSession.DoesNotExist:
-        return _fail('운동 업로드 정보를 찾을 수 없습니다.', status.HTTP_404_NOT_FOUND)
-    if session.status == WorkoutUploadSession.Status.READY:
-        return Response({
-            's': True,
-            'alreadyComplete': True,
-            'serverId': session.workout_id,
-        })
-    if session.expiresAt < timezone.now():
-        return _upload_fail(
-            request,
-            '운동 상세 파일 업로드 시간이 만료됐습니다.',
-            stage='expired',
-            metadata=session.metadata,
-        )
-    claimed = WorkoutUploadSession.objects.filter(
-        uploadId=upload_id,
-        user=request.user,
-        status__in=(
-            WorkoutUploadSession.Status.PREPARED,
-            WorkoutUploadSession.Status.FAILED,
-        ),
-    ).update(status=WorkoutUploadSession.Status.PROCESSING)
-    if not claimed:
-        return _fail('운동 업로드를 처리하고 있습니다.', status.HTTP_409_CONFLICT)
+    data = body.validated_data
+    keys = _detail_object_keys(request.user.id, data)
 
     try:
-        if not default_storage.exists(session.objectKey):
-            raise ValueError('업로드된 운동 상세 파일을 찾을 수 없습니다.')
-        with default_storage.open(session.objectKey, 'rb') as source:
-            detail_bytes = source.read(settings.DATA_UPLOAD_MAX_MEMORY_SIZE + 1)
-        if len(detail_bytes) > settings.DATA_UPLOAD_MAX_MEMORY_SIZE:
-            raise ValueError('운동 상세 파일이 허용 크기를 초과했습니다.')
-        if len(detail_bytes) != session.fileSize:
-            raise ValueError('운동 상세 파일 크기가 일치하지 않습니다.')
-        if hashlib.sha256(detail_bytes).hexdigest() != session.contentHash:
-            raise ValueError('운동 상세 파일의 해시가 일치하지 않습니다.')
-        detail_json = json.loads(detail_bytes)
-        metadata_body = WorkoutUploadSerializer(data=session.metadata)
-        if not metadata_body.is_valid():
-            raise ValueError('저장된 운동 메타데이터가 올바르지 않습니다.')
-        data = metadata_body.validated_data
+        route_json, route_bytes = _read_detail_file(
+            keys['route'], data['routeContentHash'], data['routeFileSize'], '경로'
+        )
+        heart_rate_json, heart_rate_bytes = _read_detail_file(
+            keys['heartRate'],
+            data['heartRateContentHash'],
+            data['heartRateFileSize'],
+            '심박수',
+        )
+        detail_json = {
+            'route': route_json.get('route', []) if route_json else [],
+            'heartRate': (
+                heart_rate_json.get('heartRate', []) if heart_rate_json else []
+            ),
+        }
+        for payload, sample_key in (
+            (route_json, 'route'),
+            (heart_rate_json, 'heartRate'),
+        ):
+            if payload:
+                detail_error = _validate_detail_file(payload, data, sample_key)
+                if detail_error:
+                    raise ValueError(detail_error)
         detail_error = _validate_detail(detail_json, data)
         if detail_error:
             raise ValueError(detail_error)
@@ -177,61 +138,77 @@ def complete_workout_upload(request):
             request,
             data,
             detail_json,
-            detail_bytes,
-            session.objectKey,
-            session.contentHash,
+            route_bytes,
+            heart_rate_bytes,
+            keys,
         )
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
-        try:
-            default_storage.delete(session.objectKey)
-        except Exception:
-            _logger.exception(
-                'workout upload cleanup failed · user=%s · workout=%s',
-                request.user.id,
-                session.sourceWorkoutId,
-            )
-        WorkoutUploadSession.objects.filter(uploadId=upload_id).update(
-            status=WorkoutUploadSession.Status.FAILED
-        )
         return _upload_fail(
             request,
             str(error),
-            stage='complete_validation',
-            metadata=session.metadata,
+            stage='create_validation',
+            metadata=data,
         )
     except Exception:
-        WorkoutUploadSession.objects.filter(uploadId=upload_id).update(
-            status=WorkoutUploadSession.Status.FAILED
-        )
         _logger.exception(
-            'workout upload failed · stage=complete_processing · user=%s'
+            'workout upload failed · stage=create_processing · user=%s'
             ' · workout=%s',
             request.user.id,
-            session.sourceWorkoutId,
+            data['sourceWorkoutId'],
         )
         raise
-
-    WorkoutUploadSession.objects.filter(uploadId=upload_id).update(
-        status=WorkoutUploadSession.Status.READY,
-        workout_id=result['serverId'],
-    )
     return Response({'s': True, **result})
 
 
-def _session_metadata(data):
+def _detail_object_keys(user_id: int, data: dict) -> dict[str, str | None]:
+    def key(kind, content_hash):
+        return f'workouts/{user_id}/{kind}/{content_hash}.json' if content_hash else None
+
     return {
-        key: value.isoformat() if hasattr(value, 'isoformat') else value
-        for key, value in data.items()
-        if key != 'fileSize'
+        'route': key('route', data['routeContentHash']),
+        'heartRate': key('heart-rate', data['heartRateContentHash']),
     }
 
 
-def _workout_upload_form(object_key: str, file_size: int):
-    if not settings.S3_BUCKET_NAME or not settings.S3_PUBLIC_ENDPOINT_URL:
+def _prepare_file_upload(request, object_key: str | None, file_size: int):
+    if object_key is None:
+        return {'uploadRequired': False, 'uploadUrl': None, 'uploadFields': {}}
+    upload_required = not default_storage.exists(object_key)
+    upload = (
+        _workout_upload_form(request, object_key, file_size)
+        if upload_required
+        else None
+    )
+    return {
+        'uploadRequired': upload_required,
+        'uploadUrl': upload['url'] if upload else None,
+        'uploadFields': upload['fields'] if upload else {},
+    }
+
+
+def _read_detail_file(object_key, expected_hash, expected_size, label):
+    if object_key is None:
+        return None, b''
+    if not default_storage.exists(object_key):
+        raise ValueError(f'업로드된 {label} 파일을 찾을 수 없습니다.')
+    with default_storage.open(object_key, 'rb') as source:
+        content = source.read(settings.DATA_UPLOAD_MAX_MEMORY_SIZE + 1)
+    if len(content) > settings.DATA_UPLOAD_MAX_MEMORY_SIZE:
+        raise ValueError(f'{label} 파일이 허용 크기를 초과했습니다.')
+    if len(content) != expected_size:
+        raise ValueError(f'{label} 파일 크기가 일치하지 않습니다.')
+    if hashlib.sha256(content).hexdigest() != expected_hash:
+        raise ValueError(f'{label} 파일의 해시가 일치하지 않습니다.')
+    return json.loads(content), content
+
+
+def _workout_upload_form(request, object_key: str, file_size: int):
+    public_endpoint = _public_object_endpoint(request)
+    if not settings.S3_BUCKET_NAME or not public_endpoint:
         raise ValueError('S3 직접 업로드 설정이 없습니다.')
     client = boto3.client(
         's3',
-        endpoint_url=settings.S3_PUBLIC_ENDPOINT_URL,
+        endpoint_url=public_endpoint,
         aws_access_key_id=settings.S3_ACCESS_KEY,
         aws_secret_access_key=settings.S3_SECRET_KEY,
         region_name=settings.S3_REGION,
@@ -252,9 +229,9 @@ def _persist_direct_upload(
     request,
     data,
     detail_json,
-    detail_bytes,
-    object_key,
-    content_hash,
+    route_bytes,
+    heart_rate_bytes,
+    object_keys,
 ):
     heart_rates = detail_json['heartRate']
     heart_values = [round(float(sample['bpm'])) for sample in heart_rates]
@@ -279,11 +256,29 @@ def _persist_direct_upload(
         'sourceName': data['sourceName'],
         'sourceWorkoutId': data['sourceWorkoutId'],
     }
-    old_key = None
+    old_keys = set()
+    detail_unchanged = False
+    previously_affected_ids = set()
+    previous_relation_keys = set()
     with transaction.atomic():
         defaults = {field: data.get(field) for field in mutable_fields}
         defaults.update(heart_summary)
         workout, created = Workout.objects.get_or_create(**identity, defaults=defaults)
+        if not created:
+            previous_relations = HighFive.objects.filter(
+                Q(workoutA=workout) | Q(workoutB=workout)
+            ).values_list(
+                'workoutA_id',
+                'workoutB_id',
+                'indexVersion_id',
+                'h3Cell',
+                'overlapStartedAt',
+                'overlapEndedAt',
+            )
+            for relation in previous_relations:
+                workout_a_id, workout_b_id = relation[:2]
+                previously_affected_ids.update((workout_a_id, workout_b_id))
+                previous_relation_keys.add(relation)
         changed = []
         if not created:
             for field, value in defaults.items():
@@ -296,30 +291,38 @@ def _persist_direct_upload(
             if changed:
                 workout.save(update_fields=[*changed, 'updatedAt'])
         current = WorkoutDetail.objects.filter(workout=workout).first()
-        if current and current.contentHash == content_hash:
+        if current and current.contentHash == data['detailContentHash']:
             segment_count = ensure_h3_segments(workout, detail_json['route'])
-            return {
-                'serverId': workout.id,
-                'created': created,
-                'unchanged': not created and not changed,
-                'trajectorySegmentCount': segment_count,
-            }
-        old_key = current.objectKey if current else None
-        WorkoutDetail.objects.update_or_create(
-            workout=workout,
-            defaults={
-                'objectKey': object_key,
-                'contentHash': content_hash,
-                'formatVersion': detail_json['formatVersion'],
-                'routePointCount': len(detail_json['route']),
-                'heartRateSampleCount': len(heart_rates),
-                'fileSize': len(detail_bytes),
-            },
-        )
-        if not created and not changed:
-            workout.save(update_fields=['updatedAt'])
-        segment_count = rebuild_h3_segments(workout, detail_json['route'])
-    if old_key and old_key != object_key:
+            detail_unchanged = True
+        else:
+            if current:
+                old_keys.update(
+                    key for key in (
+                        current.routeObjectKey,
+                        current.heartRateObjectKey,
+                    ) if key
+                )
+            WorkoutDetail.objects.update_or_create(
+                workout=workout,
+                defaults={
+                    'routeObjectKey': object_keys['route'],
+                    'routeContentHash': data['routeContentHash'],
+                    'routeFileSize': len(route_bytes),
+                    'heartRateObjectKey': object_keys['heartRate'],
+                    'heartRateContentHash': data['heartRateContentHash'],
+                    'heartRateFileSize': len(heart_rate_bytes),
+                    'contentHash': data['detailContentHash'],
+                    'formatVersion': 1,
+                    'routePointCount': len(detail_json['route']),
+                    'heartRateSampleCount': len(heart_rates),
+                    'fileSize': len(route_bytes) + len(heart_rate_bytes),
+                },
+            )
+            if not created and not changed:
+                workout.save(update_fields=['updatedAt'])
+            segment_count = rebuild_h3_segments(workout, detail_json['route'])
+    current_keys = {key for key in object_keys.values() if key}
+    for old_key in old_keys - current_keys:
         try:
             if default_storage.exists(old_key):
                 default_storage.delete(old_key)
@@ -330,11 +333,27 @@ def _persist_direct_upload(
                 old_key,
             )
             raise
+    # 운동과 H3가 커밋된 뒤 판정해야 동시에 올라온 다른 사용자의 경로도 볼 수 있다.
+    # 판정 실패 시 이미 전송한 객체는 그대로 남아 create 재시도에서 재사용된다.
+    if segment_count == 0:
+        clear_high_fives(
+            workout,
+            previously_affected_ids=previously_affected_ids,
+            had_previous_relations=bool(previous_relation_keys),
+        )
+        high_five_count = 0
+    else:
+        high_five_count = rebuild_high_fives(
+            workout,
+            previously_affected_ids=previously_affected_ids,
+            previous_relation_keys=previous_relation_keys,
+        )
     return {
         'serverId': workout.id,
         'created': created,
-        'unchanged': False,
+        'unchanged': detail_unchanged and not created and not changed,
         'trajectorySegmentCount': segment_count,
+        'highFiveCount': high_five_count,
     }
 
 
@@ -366,14 +385,13 @@ def _upload_fail(
 
 
 
-def _validate_detail(detail, metadata):
+def _validate_detail_file(detail, metadata, sample_key):
     if not isinstance(detail, dict) or detail.get('formatVersion') != 1:
         return '지원하지 않는 운동 상세 파일 버전입니다.'
-    for key in ('route', 'heartRate'):
-        if not isinstance(detail.get(key), list):
-            return f'{key}는 배열이어야 합니다.'
-        if len(detail[key]) > 100_000:
-            return f'{key} 샘플이 너무 많습니다.'
+    if not isinstance(detail.get(sample_key), list):
+        return f'{sample_key}는 배열이어야 합니다.'
+    if len(detail[sample_key]) > 100_000:
+        return f'{sample_key} 샘플이 너무 많습니다.'
     identity_fields = {
         'source': 'source',
         'sourceName': 'sourceName',
@@ -388,6 +406,14 @@ def _validate_detail(detail, metadata):
         actual = parse_datetime(str(detail.get(detail_key)))
         if actual is None or actual != metadata[metadata_key]:
             return f'상세 파일의 {detail_key} 값이 메타데이터와 다릅니다.'
+    return None
+
+
+def _validate_detail(detail, metadata):
+    if not isinstance(detail.get('route'), list):
+        return 'route는 배열이어야 합니다.'
+    if not isinstance(detail.get('heartRate'), list):
+        return 'heartRate는 배열이어야 합니다.'
     try:
         previous_timestamp = None
         for point in detail['route']:
@@ -415,7 +441,7 @@ def _validate_detail(detail, metadata):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def download_workouts(request):
-    """서버 스냅샷 시각까지 변경된 내 운동을 20건씩 반환한다."""
+    """서버 스냅샷 시각까지 변경된 내 운동을 10건씩 반환한다."""
     snapshot_value = request.query_params.get('snapshot')
     snapshot_at = parse_datetime(snapshot_value) if snapshot_value else timezone.now()
     if snapshot_at is None or timezone.is_naive(snapshot_at):
@@ -467,10 +493,15 @@ def download_workouts(request):
         }, separators=(',', ':')).encode()
         next_cursor = base64.urlsafe_b64encode(payload).decode().rstrip('=')
 
+    serialized = WorkoutSerializer(page, many=True).data
+    summaries = high_five_summaries([workout.id for workout in page])
+    for workout, item in zip(page, serialized):
+        item['highFives'] = summaries[workout.id]
+
     return Response({
         's': True,
         'serverTime': snapshot_at,
-        'workouts': WorkoutSerializer(page, many=True).data,
+        'workouts': serialized,
         'nextCursor': next_cursor,
         'hasMore': has_more,
     })
@@ -479,7 +510,7 @@ def download_workouts(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def download_workout_detail(request, workout_id):
-    """내 운동의 경로·심박 원본 파일을 받을 짧은 다운로드 URL을 반환한다."""
+    """내 운동의 경로·심박 파일별 짧은 다운로드 URL을 반환한다."""
     try:
         workout = Workout.objects.select_related('detail').get(
             pk=workout_id,
@@ -491,7 +522,14 @@ def download_workout_detail(request, workout_id):
         return _fail('운동 상세 정보를 찾을 수 없습니다.', status.HTTP_404_NOT_FOUND)
 
     try:
-        download_url = _detail_download_url(request, detail.objectKey)
+        route_url = (
+            _detail_download_url(request, detail.routeObjectKey)
+            if detail.routeObjectKey else None
+        )
+        heart_rate_url = (
+            _detail_download_url(request, detail.heartRateObjectKey)
+            if detail.heartRateObjectKey else None
+        )
     except (OSError, TypeError, ValueError):
         return _fail(
             '운동 상세 파일 다운로드 주소를 만들지 못했습니다.',
@@ -500,15 +538,19 @@ def download_workout_detail(request, workout_id):
 
     return Response({
         's': True,
-        'downloadUrl': download_url,
+        'routeDownloadUrl': route_url,
+        'heartRateDownloadUrl': heart_rate_url,
         'expiresInSeconds': settings.S3_DOWNLOAD_EXPIRES_SECONDS,
-        'contentHash': detail.contentHash,
-        'fileSize': detail.fileSize,
+        'detailContentHash': detail.contentHash,
+        'routeContentHash': detail.routeContentHash,
+        'routeFileSize': detail.routeFileSize,
+        'heartRateContentHash': detail.heartRateContentHash,
+        'heartRateFileSize': detail.heartRateFileSize,
     })
 
 
 def _detail_download_url(request, object_key: str) -> str:
-    public_endpoint = settings.S3_PUBLIC_ENDPOINT_URL
+    public_endpoint = _public_object_endpoint(request)
     if not settings.S3_BUCKET_NAME or not public_endpoint:
         return request.build_absolute_uri(default_storage.url(object_key))
 
@@ -524,6 +566,17 @@ def _detail_download_url(request, object_key: str) -> str:
         Params={'Bucket': settings.S3_BUCKET_NAME, 'Key': object_key},
         ExpiresIn=settings.S3_DOWNLOAD_EXPIRES_SECONDS,
     )
+
+
+def _public_object_endpoint(request) -> str | None:
+    """개발에서는 API 요청 호스트를 그대로 사용해 MinIO 공개 주소를 만든다."""
+    if not settings.DEBUG:
+        return settings.S3_PUBLIC_ENDPOINT_URL
+
+    hostname = urlparse(f'//{request.get_host()}').hostname
+    if not hostname:
+        return settings.S3_PUBLIC_ENDPOINT_URL
+    return f'{request.scheme}://{hostname}:9000'
 
 
 @api_view(['GET'])

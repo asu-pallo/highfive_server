@@ -10,9 +10,9 @@ urlpatterns = [
         name='workout-upload-prepare',
     ),
     path(
-        'workouts/upload/complete/',
-        views.complete_workout_upload,
-        name='workout-upload-complete',
+        'workouts/upload/create/',
+        views.create_workout,
+        name='workout-upload-create',
     ),
     path('workouts/', views.download_workouts, name='workout-download'),
     path(

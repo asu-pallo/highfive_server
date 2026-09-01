@@ -2,7 +2,6 @@
 
 import django.contrib.postgres.fields.ranges
 import django.db.models.deletion
-import uuid
 from django.conf import settings
 from django.db import migrations, models
 
@@ -72,7 +71,12 @@ class Migration(migrations.Migration):
             name='WorkoutDetail',
             fields=[
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('objectKey', models.CharField(max_length=700, unique=True)),
+                ('routeObjectKey', models.CharField(blank=True, max_length=700, null=True, unique=True)),
+                ('routeContentHash', models.CharField(blank=True, default='', max_length=64)),
+                ('routeFileSize', models.PositiveBigIntegerField(default=0)),
+                ('heartRateObjectKey', models.CharField(blank=True, max_length=700, null=True, unique=True)),
+                ('heartRateContentHash', models.CharField(blank=True, default='', max_length=64)),
+                ('heartRateFileSize', models.PositiveBigIntegerField(default=0)),
                 ('contentHash', models.CharField(max_length=64)),
                 ('formatVersion', models.PositiveSmallIntegerField(default=1)),
                 ('routePointCount', models.PositiveIntegerField(default=0)),
@@ -83,23 +87,25 @@ class Migration(migrations.Migration):
             ],
         ),
         migrations.CreateModel(
-            name='WorkoutUploadSession',
+            name='HighFive',
             fields=[
-                ('uploadId', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('source', models.CharField(max_length=30)),
-                ('sourceName', models.CharField(max_length=255)),
-                ('sourceWorkoutId', models.CharField(max_length=255)),
-                ('metadata', models.JSONField()),
-                ('objectKey', models.CharField(max_length=700)),
-                ('contentHash', models.CharField(max_length=64)),
-                ('fileSize', models.PositiveBigIntegerField()),
-                ('status', models.CharField(choices=[('prepared', 'Prepared'), ('processing', 'Processing'), ('ready', 'Ready'), ('failed', 'Failed')], db_index=True, default='prepared', max_length=20)),
-                ('expiresAt', models.DateTimeField(db_index=True)),
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('h3Cell', models.CharField(max_length=32)),
+                ('overlapStartedAt', models.DateTimeField()),
+                ('overlapEndedAt', models.DateTimeField()),
                 ('createdAt', models.DateTimeField(auto_now_add=True)),
-                ('updatedAt', models.DateTimeField(auto_now=True)),
-                ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='workoutUploadSessions', to=settings.AUTH_USER_MODEL)),
-                ('workout', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='uploadSessions', to='workout_manager.workout')),
+                ('indexVersion', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='highFives', to='workout_manager.spatialindexversion')),
+                ('segmentA', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsA', to='workout_manager.trajectorysegment')),
+                ('segmentB', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsB', to='workout_manager.trajectorysegment')),
+                ('userA', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsA', to=settings.AUTH_USER_MODEL)),
+                ('userB', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsB', to=settings.AUTH_USER_MODEL)),
+                ('workoutA', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsA', to='workout_manager.workout')),
+                ('workoutB', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='highFivesAsB', to='workout_manager.workout')),
             ],
+            options={
+                'indexes': [models.Index(fields=['workoutA', 'indexVersion'], name='workout_man_workout_d86941_idx'), models.Index(fields=['workoutB', 'indexVersion'], name='workout_man_workout_d3400c_idx')],
+                'constraints': [models.UniqueConstraint(fields=('workoutA', 'workoutB', 'indexVersion'), name='unique_workout_pair_high_five'), models.CheckConstraint(condition=models.Q(('workoutA__lt', models.F('workoutB'))), name='high_five_ordered_workout_pair'), models.CheckConstraint(condition=models.Q(('overlapStartedAt__lt', models.F('overlapEndedAt'))), name='high_five_positive_overlap')],
+            },
         ),
         migrations.AddIndex(
             model_name='workout',
@@ -124,9 +130,5 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name='trajectorysegment',
             constraint=models.UniqueConstraint(fields=('workout', 'indexVersion', 'sequence'), name='unique_workout_index_segment_sequence'),
-        ),
-        migrations.AddConstraint(
-            model_name='workoutuploadsession',
-            constraint=models.UniqueConstraint(fields=('user', 'source', 'sourceName', 'sourceWorkoutId', 'contentHash'), name='unique_workout_upload_content'),
         ),
     ]
