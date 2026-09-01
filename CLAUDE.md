@@ -1,255 +1,119 @@
 # CLAUDE.md
 
-이 파일은 Claude Code가 이 저장소에서 작업할 때 참고하는 가이드다.
+이 파일은 HighFive Django 저장소에서 작업할 때 필요한 **서버 전용 지침**만 담는다.
+제품 정책과 앱 구현을 반복해서 설명하지 않는다.
 
-## 프로젝트 개요
+## 먼저 확인할 문서
 
-**HighFive 서버** — 달리기 기록 기반 소셜 러닝 앱의 백엔드.
+| 작업 | 문서 |
+|---|---|
+| 운동 동기화·H3·하이파이브·DB 정책 | [`../highfive_guide.md`](../highfive_guide.md)의 관련 절 |
+| 앱 요청·응답 사용 방식 | 앱 코드와 [`../app/highfive_local_client.md`](../app/highfive_local_client.md) |
+| 남은 작업 | [`../TODO.md`](../TODO.md) |
 
-핵심 기능: 달리기 중 **같은 시간, 같은 장소에 있었던 사용자끼리 "하이파이브"로 표기**한다.
-경로가 겹친 지점에 박수 아이콘을 표시한다.
+`TODO.md`는 기존 항목을 수정하거나 삭제하지 않고 새 항목만 추가한다.
+
+## 현재 서버 경계
+
+- Django 5.2 + Django REST Framework
+- SimpleJWT: access 30분, refresh 90일, 회전 및 블랙리스트
+- PostgreSQL 17: 로컬 Docker, 운영 AWS RDS
+- MinIO: 로컬 객체 저장소, 운영은 비공개 S3/CDN
+- 운동 목록은 고정 snapshot과 불투명 cursor로 10건씩 반환한다.
+- GPS·심박 원본은 DB 배열이 아니라 분리된 비공개 객체로 저장한다.
+- 서버가 원본 GPS를 H3 Resolution 11 체류 구간으로 변환한다.
+- 하이파이브 관계 테이블과 서버 Redis 캐시는 없다. 요청받은 운동 최대 10건을 실시간 판정한다.
 
 ## 경로
 
 | 대상 | 경로 |
 |---|---|
-| **HighFive 루트** | `/Users/asu/Documents/pallo/highfive` |
-| **HighFive 서버 (이 저장소)** | `/Users/asu/Documents/pallo/highfive/server` |
-| **HighFive 앱** (Flutter) | `/Users/asu/Documents/pallo/highfive/app` |
+| 프로젝트 루트 | `/Users/asu/Documents/pallo/highfive` |
+| 서버 | `/Users/asu/Documents/pallo/highfive/server` |
+| 앱 | `/Users/asu/Documents/pallo/highfive/app` |
 
-앱은 이 서버와 짝을 이루는 클라이언트다.
-API 스펙이나 데이터 형식이 궁금하면 **추측하지 말고 앱 코드를 직접 읽어서 확인할 것.**
-
-## 현재 상태
-
-**사용자·인증, 운동 원본 동기화와 H3 경로 인덱스 저장까지 되어 있다.** 하이파이브는
-별도 테이블이나 Redis 캐시 없이 피드 10건을 조회할 때 최신 H3 구간으로 일괄 계산한다.
-
-- `user_manager` — Profile 모델 + 소셜/자동 로그인 + 닉네임 API
-- `workout_manager` — 운동별 준비 API + Presigned POST 객체 직접 업로드 + 완료 검증,
-  H3 Resolution 11 연속 체류 구간 저장 + 피드 조회 시 하이파이브 실시간 판정 + 서버 시각 기반
-  10건 커서 다운로드와 상세 API
-- 앱 피드는 서버에서 내려받아 Drift에 캐시한 운동만 표시한다
-- DB는 Docker PostgreSQL 17로 전환했다. 객체 저장소는 로컬 MinIO다
-- git 저장소다(앱과 별개). 커밋은 유저가 직접 관리한다
-
-## 기술 스택
-
-열품타(`pi_django`)와 같은 계열로 맞췄다. 버전은 `requirements.txt` 에 고정돼 있다.
-
-| 항목 | 선택 |
-|---|---|
-| 프레임워크 | Django 5.2 |
-| API | Django REST Framework |
-| 인증 | SimpleJWT (access 30분 / refresh 90일, 회전 + 블랙리스트) |
-| 설정 주입 | python-dotenv (`.env`) |
-| DB | PostgreSQL 17 (로컬 Docker, 운영 AWS RDS) |
-| 객체 저장소 | Django Storage + MinIO (개발), 비공개 S3 (운영) |
-
-### PostgreSQL 선택 방향
-
-- 로컬은 Docker PostgreSQL, 운영은 AWS RDS PostgreSQL을 사용한다.
-- H3 세그먼트의 체류 시간은 `DateTimeRangeField`/`tstzrange`로 저장한다.
-- 하이파이브 후보는 동일 H3 셀과 `period && currentPeriod` 조건으로 조회한다.
-- `btree_gist`와 GiST 복합 인덱스는 실제 실행 계획과 부하 테스트 후 확정한다.
-- 향후 정밀 거리·지역 통계가 필요할 때만 PostGIS를 추가한다. 초기 H3 구현에는 넣지 않는다.
-- GPS·심박 원본은 PostgreSQL에 배열 행으로 넣지 않고 기존처럼 비공개 객체 저장소에 둔다.
-- 기존 SQLite 개발 데이터는 이관하지 않았고 현재 모델 기준 초기 migration을 새로 만들었다.
-
-> **열품타와 다른 점 — JWT 수명.**
-> 열품타는 access 토큰을 36,500일(100년)로 두고 refresh 를 쓰지 않아, 토큰이 유출돼도
-> 무효화할 방법이 없다. 여기서는 짧은 access + 회전되는 refresh 로 간다.
+API 스펙을 바꿀 때 앱 파서와 호출 순서를 직접 확인한다.
 
 ## 구조
 
-```
+```text
 server/
-├─ manage.py
-├─ requirements.txt
-├─ .env            # 커밋 안 됨
-├─ .env.example    # 형식만 커밋
-├─ secrets/        # Firebase 서비스 계정 키. 커밋 안 됨
-├─ config/         # 프로젝트 설정 패키지 (열품타의 pi/ 에 해당)
-│  ├─ settings.py
-│  ├─ api.py       # DRF 예외를 {'s': false, 'msg': ...} 로 통일
-│  ├─ urls.py      # 앱이 부르는 엔드포인트는 전부 /api/ 아래
-│  ├─ asgi.py
-│  └─ wsgi.py
-├─ user_manager/   # 사용자·인증
-   ├─ models.py       Profile
-   ├─ views.py        signin · autologin · nickname
-   ├─ firebase.py     ID 토큰 검증
-   ├─ nickname.py     정규화·검증 규칙
-   └─ management/commands/runserver.py   # 아래 참고
-└─ workout_manager/ # 운동 저장·상세 파일·증분 동기화
-   ├─ models.py       Workout · WorkoutDetail · SpatialIndexVersion · TrajectorySegment
-   ├─ spatial_index.py H3 Resolution 11 변환·통과 셀 보완·구간 저장
-   ├─ high_five.py    동일 H3 셀·시간 겹침 후보 조회와 상대 사용자별 대표 판정
-   ├─ serializers.py  업로드 검증·다운로드 응답
-   └─ views.py        stateless prepare/create upload · download_workouts · detail
+├─ dev.py
+├─ config/             설정·공통 API 예외·루트 URL
+├─ user_manager/       Profile·Firebase 로그인·닉네임
+└─ workout_manager/
+   ├─ models.py        Workout·WorkoutDetail·SpatialIndexVersion·TrajectorySegment
+   ├─ serializers.py   업로드 검증·운동 응답
+   ├─ spatial_index.py H3 변환과 구간 저장
+   ├─ high_five.py     페이지 단위 실시간 판정
+   └─ views.py         업로드·다운로드·상세·H3 API
 ```
-
-> **`runserver` 를 덮어썼다.** 기본이 `127.0.0.1` 이라 실기기가 못 붙고,
-> `runserver 0.0.0.0` 은 포트가 없다고 에러가 난다. 그래서 기본 주소를 `0.0.0.0` 으로
-> 바꾸고 주소만 줘도 포트를 붙이게 했다. `DEBUG=False` 면 `127.0.0.1` 로 되돌아간다.
->
-> ⚠️ 이 때문에 **`INSTALLED_APPS` 에서 `user_manager` 가 맨 앞**에 있다. Django 는
-> 목록을 뒤에서부터 훑으며 관리 명령을 등록해서, 뒤에 두면 `staticfiles` 의 것이
-> 우리 걸 덮어쓴다.
 
 ## 실행
 
-처음 받았을 때:
-
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env      # DJANGO_SECRET_KEY 를 채운다
-.venv/bin/python manage.py migrate
+python dev.py up       # PostgreSQL·MinIO·Redis 확인, migrate, 0.0.0.0:8000 실행
+python dev.py status
+python dev.py logs
+python dev.py db
+python dev.py down     # 데이터 유지
+python dev.py reset    # 로컬 PostgreSQL·MinIO·Redis 초기화 후 다시 실행
 ```
 
-개발 환경은 `manage.py`와 같은 위치의 `dev.py`로 함께 관리한다. **기본이
-`0.0.0.0:8000`**이라 실기기에서도 붙는다.
-
-```bash
-python dev.py up       # PostgreSQL·MinIO·migrate 후 Django 실행
-python dev.py status   # 서버와 컨테이너 상태
-python dev.py logs     # Docker 로그
-python dev.py db       # 컨테이너의 psql 콘솔
-python dev.py down     # 종료, 데이터 유지
-python dev.py reset    # 로컬 PostgreSQL 스키마·MinIO 초기화 후 다시 up
-```
-
-Android 실단말의 MinIO 직접 다운로드는 `.env`의
-`S3_PUBLIC_ENDPOINT_URL=http://127.0.0.1:9000`을 사용한다. `dev.py up`은 연결된 단말에
-`adb reverse tcp:9000 tcp:9000`을 설정하고 `down`은 제거한다. MinIO API는 LAN에 직접
-공개하지 않는다.
-
-앱은 `app/lib/src/core/config/api_config.dart` 의 `_devUrl` 을 본다. 실기기로 테스트할
-때는 거기에 **맥의 LAN 주소**가 들어가 있어야 한다(와이파이가 바뀌면 달라진다).
-
-확인: `GET /api/health/` → `{"s": true}`
-
-## 규약
-
-- 응답은 열품타와 같이 `{'s': bool, ...}` 형태를 기본으로 한다.
-- DRF 기본 권한이 `IsAuthenticated` 다. **공개 API 는 뷰에서 `AllowAny` 를 명시**한다.
-- 시각은 전부 UTC 로 저장한다. 앱도 UTC 로 보낸다.
-- 모델 필드는 **camelCase** 로 쓴다(열품타와 맞춤). Django 관례와 다르지만 두 서버를
-  오갈 때 헷갈리지 않는 쪽을 택했고, API JSON 도 camelCase 라 변환 계층이 없다.
+`reset`은 로컬 개발 데이터에만 사용한다. 실기기 연결을 위해 Django는 기본
+`0.0.0.0:8000`으로 실행한다. MinIO 접근 방식과 LAN/ADB reverse 설정은 `dev.py`의 현재
+구현을 기준으로 확인한다.
 
 ## API
 
-| 엔드포인트 | 권한 | 하는 일 |
-|---|---|---|
-| `GET /api/health/` | 공개 | 헬스체크 |
-| `POST /api/auth/signin/` | 공개 | **소셜 로그인.** 가입을 겸한다 |
-| `POST /api/auth/autologin/` | 공개 | **자동 로그인.** refresh 토큰으로 세션을 잇는다 |
-| `POST /api/users/nickname/` | 인증 | 닉네임 설정·변경 |
-| `POST /api/workouts/upload/prepare/` | 인증 | 메타데이터·해시·크기 검증 후 필요한 경우 5분 Presigned POST 폼 발급 |
-| `POST /api/workouts/upload/create/` | 인증 | 경로·심박 S3 객체를 각각 검증한 후 운동·상세·H3 생성 |
-| `GET /api/workouts/` | 인증 | 변경된 내 운동을 고정 스냅샷에서 10건씩 다운로드 |
-| `POST /api/workouts/high-fives/` | 인증 | 현재 피드 운동 ID 최대 10개의 HighFive 요약을 실시간 일괄 계산 |
-| `GET /api/workouts/<id>/detail/` | 인증 | 소유권 확인 후 GPS·심박 원본의 5분 다운로드 URL 반환 |
-| `GET /api/workouts/<id>/h3/` | 인증 | 소유권 확인 후 현재 H3 구간·육각형 경계 반환 |
+| 엔드포인트 | 역할 |
+|---|---|
+| `POST /api/auth/signin/` | 소셜 로그인 및 가입 |
+| `POST /api/auth/autologin/` | refresh 기반 자동 로그인 |
+| `POST /api/users/nickname/` | 닉네임 설정·변경 |
+| `POST /api/workouts/upload/prepare/` | 검증 후 필요한 Presigned POST 발급 |
+| `POST /api/workouts/upload/create/` | 객체 검증 후 운동·상세·H3 생성 |
+| `GET /api/workouts/` | 변경된 내 운동 10건 커서 다운로드 |
+| `POST /api/workouts/high-fives/` | 내 운동 최대 10건의 하이파이브 실시간 계산 |
+| `GET /api/workouts/<id>/detail/` | GPS·심박의 짧은 다운로드 URL 반환 |
+| `GET /api/workouts/<id>/h3/` | 소유자의 H3 구간과 셀 경계 반환 |
 
-운동 목록은 `since`, `snapshot`, `cursor`를 사용한다. 정렬 기준은
-`(updatedAt DESC, id DESC)`이며 커서는 서버가 발급한 불투명 문자열이다. 앱은 첫
-페이지의 `serverTime`을 다음 페이지의 `snapshot`으로 유지하고, 마지막 페이지까지
-저장한 뒤에만 다음 동기화의 `since`로 기록한다.
+응답은 기본적으로 `{'s': bool, ...}` 형태다. 공개 API는 `AllowAny`를 명시하고 나머지는
+기본 `IsAuthenticated`를 유지한다.
 
-상세 API는 원본 JSON이나 객체 path만 반환하지 않는다. 환경별 객체 저장소/CDN 주소와
-서명이 포함된 완성된 `downloadUrl`, `expiresInSeconds`, `contentHash`, `fileSize`를
-반환한다. 앱은 저장소 인증키나 base URL을 갖지 않고 URL에서 파일을 직접 다운로드한다.
+## 데이터·판정 원칙
 
-**로그인은 이 둘뿐이다. 별도의 회원가입 API 도, 기기 정보 API 도 없다.**
+- 모델과 API JSON 필드는 현재 프로젝트 규칙에 따라 camelCase를 사용한다.
+- 시각은 UTC로 저장하고 범위는 `[start, end)`로 판정한다.
+- 운동 식별은 `UNIQUE(user, source, sourceName, sourceWorkoutId)`로 보장한다.
+- 업로드는 객체 해시·크기·소유권을 검증한 뒤 트랜잭션으로 메타데이터와 H3를 확정한다.
+- 하이파이브는 다른 사용자, 같은 활성 인덱스 버전, 같은 H3 셀, 양의 시간 겹침이 조건이다.
+- 한 운동에서 같은 상대 사용자는 여러 번 겹쳐도 한 명으로 집계한다.
+- 하이파이브는 업로드 시 저장하지 않고 피드에서 요청한 운동만 계산한다.
+- GPS·심박 원본이나 presigned URL을 릴리즈 로그에 남기지 않는다.
 
-소셜 로그인은 클라이언트가 "처음인지"를 알 수 없어서 `signin` 이 uid 로 판단해 없으면
-만든다. 앱은 응답 `profile.nickname`이 비었는지로 닉네임 설정 필요 여부를 판단한다.
+## 인증·프로필
 
-```
-앱 실행 → 저장된 refresh 있음? ─ 예 → POST /auth/autologin/
-                              └ 아니오 → 소셜 로그인 → POST /auth/signin/
-                                            ↓
-                                   profile.nickname 이 비었으면 닉네임 화면
-```
+- 로그인 응답은 토큰과 `profile`을 분리한다.
+- `profile.nickname`이 비어 있으면 앱이 닉네임 화면으로 보낸다.
+- 닉네임은 앞뒤 공백 제거 후 2~12자의 한글 완성형·영문·숫자만 허용하고 중복은 허용한다.
+- 사용자 식별은 닉네임이 아니라 user ID로 한다.
+- refresh 실패가 네트워크 오류인지 세션 만료인지 구분한다.
 
-### 기기 정보·FCM 토큰은 로그인이 갱신한다
+## 확인 명령
 
-두 로그인 API 모두 아래를 **선택 항목**으로 받는다. 안 보내면 이전 값을 유지한다.
-
-```
-deviceType  deviceModel  osVersion  appVersion  timezone  fcmToken
-```
-
-갱신 시점을 "로그인할 때" 하나로 묶었다. access 가 30분이라 앱은 자주 `autologin` 을
-부르게 되고, 그때마다 최신 값이 올라온다. 갱신 전용 API 를 따로 두면 앱이 두 군데서
-같은 일을 하게 된다.
-
-`autologin` 은 access 만료 재발급도 겸한다. **만료된 access 로는 부를 수 없어서
-`AllowAny`** 이고, 인증은 본문의 refresh 토큰 자체가 한다.
-
-`ROTATE_REFRESH_TOKENS` 라 **refresh 도 새것으로 바뀐다.** 앱은 응답의 refresh 로
-저장값을 덮어써야 한다. 예전 것을 계속 쓰면 블랙리스트에 걸려 다음부터 막힌다.
-
-> ⚠️ Profile 한 줄에 덮어쓰므로 **마지막에 로그인한 기기만 남는다.** 한 계정이 아이폰과
-> 갤럭시를 같이 쓰면 먼저 쓰던 기기로는 푸시가 가지 않는다. 다기기를 제대로 다뤄야 할
-> 때 Device 테이블로 분리한다.
-
-## 인증
-
-앱이 Firebase Auth 로 구글·애플 로그인 → **Firebase ID 토큰**을 `signin` 에 보냄 →
-서버가 `firebase-admin` 으로 검증. 제공자별 검증 코드를 따로 두지 않아도 된다.
-
-**클라이언트가 보낸 uid 를 그대로 믿지 않는다.** 반드시 토큰 검증을 거친 uid만 쓴다
-(열품타는 이 검증이 없다).
-
-서비스 계정 키는 `secrets/` 에 두고 `.env` 의 `FIREBASE_CREDENTIALS` 로 경로를 준다.
-키가 없으면 `signin` 만 500 과 함께 안내 메시지를 낸다. 나머지 API 는 정상 동작한다.
-
-## Profile 컬럼
-
-```
-nickname  nicknameKey  loginProvider
-deviceType  deviceModel  osVersion  appVersion  timezone  fcmToken
-createdAt  lastLoginAt
+```bash
+.venv/bin/python manage.py check
+.venv/bin/python manage.py makemigrations --check --dry-run
+.venv/bin/python manage.py test
 ```
 
-테이블 이름은 Django 기본 규칙에 따라 `user_manager_profile` — 열품타와 같다.
-필드는 camelCase 로 맞췄다.
+모델 변경 시 migration과 테스트를 함께 갱신한다. 초기 migration을 직접 합치는 작업은 로컬
+DB를 reset하기로 합의된 개발 단계에서만 한다.
 
-## 닉네임
+## 문서 작성 규칙
 
-- `Profile.nickname` — 화면에 보이는 값
-- `Profile.nicknameKey` — 검색·정렬용 정규화 값. 중복 판정에는 쓰지 않는다
-- 앞뒤 공백을 제거한 뒤 **2~12자**만 허용한다
-- 한글 완성형·영문·숫자만 허용하며 공백·밑줄·이모지는 허용하지 않는다
-
-키는 NFKC 정규화 + `casefold()` 다. `Runner` / `runner` / `ｒｕｎｎｅｒ` 를 검색할 때
-같은 값으로 찾기 위한 것이며, 닉네임 자체는 중복을 허용한다. 사용자 식별은 닉네임이
-아니라 `user_id`로 한다. 정규화는 문자 검사보다 먼저 수행한다.
-
-## 문서
-
-- [`../highfive_guide.md`](../highfive_guide.md) — **설계 가이드 (앱·서버 공통)**
-
-앱·서버 공통의 설계 결정과 미결정 사항이 이 문서에 모인다. **루트에 있다.**
-날짜로 나누지 않고 **계속 다듬어 나가는 문서**이므로, 설계가 바뀌면 새 파일을 만들지 말고 이 문서를 갱신할 것.
-설계 관련 작업 전에 먼저 읽을 것.
-
-**서버에만 해당하는 내용**이 필요해지면 이 폴더에 별도 문서를 만든다.
-공통 내용은 루트 가이드에 두고 중복해서 적지 않는다.
-
-### 주요 미결정 사항
-
-1. 지도용 좌표 단순화 알고리즘 · 허용 오차
-2. H3 Resolution 11 최종 확정과 최소 시간 겹침
-3. H3 단계의 PostgreSQL 인덱스와 비동기 처리 방식
-4. 원본 GPS·심박 파일 포맷의 향후 버전 전략
-
-## 파일 작성 규칙
-
-- **가이드·설계 문서** — 날짜 없이 고정 파일명. 새로 만들지 말고 기존 문서를 갱신
-- **일회성 산출물** (분석 결과, 리포트 등) — `YYYYMMDD_HHMM_파일명` 형식 (생성순 정렬)
-- 백업 파일(`.backup_*`) 생성 금지
-- 한국어로 응답
+- 공통 설계는 루트 가이드에만 쓰고 이 파일에는 작업 지침만 둔다.
+- 날짜별 설계 문서를 새로 만들지 않고 기존 기준 문서를 갱신한다.
+- 백업 Markdown 파일을 만들지 않는다.
+- 한국어로 응답한다.

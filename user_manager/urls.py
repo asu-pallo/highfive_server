@@ -9,4 +9,7 @@ urlpatterns = [
     path('auth/autologin/', views.auto_login),
 
     path('users/nickname/', views.set_nickname),
+
+    # 업로드와 삭제가 같은 자원을 다루므로 POST·DELETE 를 한 경로에 둔다.
+    path('users/image/', views.profile_image),
 ]

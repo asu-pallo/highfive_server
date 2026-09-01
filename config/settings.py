@@ -165,6 +165,18 @@ S3_ENDPOINT_URL = os.getenv('S3_ENDPOINT_URL') or None
 S3_PUBLIC_ENDPOINT_URL = os.getenv('S3_PUBLIC_ENDPOINT_URL') or None
 S3_REGION = os.getenv('S3_REGION', 'ap-northeast-2')
 S3_DOWNLOAD_EXPIRES_SECONDS = 300
+
+# 프로필 이미지는 **읽기 공개 버킷**에 따로 둔다. 운동 원본과 같은 버킷에 prefix 만
+# 열면 `dev.py reset` 의 `mc anonymous set none` 이 버킷 전체를 다시 닫아 버린다.
+# 남의 프로필까지 피드에 뜨는데 서명 URL 을 쓰면 URL 이 매번 달라져 앱·CDN 캐시가
+# 무력화되므로, 추측 불가능한 UUID 키 + 만료 없는 공개 URL 로 간다.
+S3_PUBLIC_BUCKET_NAME = os.getenv('S3_PUBLIC_BUCKET_NAME', '').strip()
+
+# 운영에서 CDN 을 붙이면 이 값만 채운다. 비어 있으면 공개 endpoint + 버킷으로 만든다.
+PUBLIC_ASSET_BASE_URL = os.getenv('PUBLIC_ASSET_BASE_URL', '').strip()
+
+PROFILE_IMAGE_MAX_BYTES = int(os.getenv('PROFILE_IMAGE_MAX_BYTES', 10 * 1024 * 1024))
+PROFILE_IMAGE_SIZES = {'512': 512, '128': 128}
 if S3_BUCKET_NAME:
     STORAGES = {
         'default': {

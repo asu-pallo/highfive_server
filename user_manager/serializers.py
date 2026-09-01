@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from .models import DeviceType, Profile
+from .profile_storage import profile_image_url
 
 
 class ClientInfoSerializer(serializers.Serializer):
@@ -43,15 +44,36 @@ class NicknameSerializer(serializers.Serializer):
 
 
 class ProfileSerializer(serializers.ModelSerializer):
-    """응답에 실어 보내는 프로필."""
+    """응답에 실어 보내는 프로필.
+
+    이미지 URL 은 저장값이 아니라 요청마다 만든다. 개발은 MinIO, 운영은 CDN 이라
+    주소가 환경마다 다르고, 실단말은 접속한 호스트가 그때그때 달라지기 때문이다.
+    사진이 없으면 두 필드 모두 null 이라 앱은 기본 아바타를 그리면 된다.
+    """
 
     loginType = serializers.CharField(source='loginProvider', read_only=True)
+    imageUrl = serializers.SerializerMethodField()
+    thumbnailUrl = serializers.SerializerMethodField()
+
+    def get_imageUrl(self, profile: Profile) -> str | None:
+        return self._url(profile.imageKey)
+
+    def get_thumbnailUrl(self, profile: Profile) -> str | None:
+        return self._url(profile.imageThumbKey)
+
+    def _url(self, object_key: str) -> str | None:
+        request = self.context.get('request')
+        if not object_key or request is None:
+            return None
+        return profile_image_url(request, object_key)
 
     class Meta:
         model = Profile
         fields = (
             'nickname',
             'loginType',
+            'imageUrl',
+            'thumbnailUrl',
             'deviceType',
             'deviceModel',
             'osVersion',

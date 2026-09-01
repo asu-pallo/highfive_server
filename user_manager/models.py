@@ -65,6 +65,18 @@ class Profile(models.Model):
     # 받아서 갱신한다. 길이는 규격이 정해져 있지 않아 넉넉히 잡는다(현재 160자 안팎).
     fcmToken = models.CharField(max_length=255, default='', blank=True, db_index=True)
 
+    # ── 프로필 이미지 ──
+    #
+    # 공개 버킷의 객체 키만 들고 있고 URL 은 응답할 때 만든다. 개발은 MinIO, 운영은
+    # CDN 이라 주소가 환경마다 다른데, 저장해 두면 환경을 옮길 때 전부 틀어진다.
+    #
+    # 규격별로 파일이 따로 있다. 피드의 작은 아바타까지 512px 을 받으면 사람 수만큼
+    # 낭비된다. 키는 `profiles/<uuid>/512.webp` 처럼 UUID 폴더 아래에 둬서, 교체할 때
+    # 새 폴더에 올리고 나중에 이전 폴더를 지운다.
+    imageKey = models.CharField(max_length=200, default='', blank=True)
+    imageThumbKey = models.CharField(max_length=200, default='', blank=True)
+    imageUpdatedAt = models.DateTimeField(null=True, blank=True, default=None)
+
     createdAt = models.DateTimeField(auto_now_add=True, db_index=True)
 
     # `auto_now` 라 이 행을 저장할 때마다 갱신된다. 로그인뿐 아니라 기기 정보 갱신·

@@ -8,5 +8,6 @@ python-dotenv==1.2.3
 psycopg[binary]==3.3.4
 sqlparse==0.6.0
 django-storages[s3]==1.14.6
+Pillow==12.3.0
 h3==4.5.0
 django-redis==6.0.0

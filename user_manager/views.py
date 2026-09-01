@@ -1,7 +1,10 @@
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.exceptions import InvalidToken as JwtInvalidToken
@@ -13,6 +16,8 @@ from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from . import nickname as nickname_rules
 from .firebase import InvalidToken, NotConfigured, verify_id_token
 from .models import Profile
+from .profile_image import ProfileImageError, render_variants
+from .profile_storage import delete_objects, save_variants
 from .serializers import (
     AutoLoginSerializer,
     NicknameSerializer,
@@ -25,6 +30,11 @@ from .serializers import (
 
 def _fail(message: str, code: int = status.HTTP_400_BAD_REQUEST) -> Response:
     return Response({'s': False, 'msg': message}, status=code)
+
+
+def _profile(profile: Profile, request) -> dict:
+    """프로필 응답. 이미지 URL 을 만들려면 요청 호스트가 필요해 context 를 넘긴다."""
+    return ProfileSerializer(profile, context={'request': request}).data
 
 
 def _tokens_for(user: User) -> dict:
@@ -97,7 +107,7 @@ def sign_in(request):
 
     return Response({
         's': True,
-        'profile': ProfileSerializer(profile).data,
+        'profile': _profile(profile, request),
         **_tokens_for(user),
     })
 
@@ -154,7 +164,7 @@ def auto_login(request):
 
     return Response({
         's': True,
-        'profile': ProfileSerializer(profile).data,
+        'profile': _profile(profile, request),
         **tokens,
     })
 
@@ -179,4 +189,58 @@ def set_nickname(request):
     profile.nicknameKey = key
     profile.save(update_fields=['nickname', 'nicknameKey', 'lastLoginAt'])
 
-    return Response({'s': True, 'profile': ProfileSerializer(profile).data})
+    return Response({'s': True, 'profile': _profile(profile, request)})
+
+
+@api_view(['POST', 'DELETE'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser])
+def profile_image(request):
+    """프로필 이미지를 올리거나 지운다. `image` 필드에 파일 하나를 담아 보낸다.
+
+    **Presigned 직접 업로드를 쓰지 않는다.** 서버가 어차피 원본 바이트를 봐야 하기
+    때문이다 — 진짜 이미지인지 디코드해 확인하고, EXIF(GPS 포함)를 떼고, 규격별로
+    다시 인코딩한다. 앱이 S3 로 바로 올리면 서버가 그 파일을 **되받아** 같은 일을
+    해야 해서 왕복만 늘고, 생성 호출이 끊기면 고아 객체도 남는다. 운동 원본은 최대
+    25MB 라 서버를 거치지 않는 게 맞지만 프로필은 반대다.
+    """
+    profile = request.user.profile
+    previous = [profile.imageKey, profile.imageThumbKey]
+
+    if request.method == 'DELETE':
+        _clear_profile_image(profile)
+        delete_objects(previous)
+        return Response({'s': True, 'profile': _profile(profile, request)})
+
+    upload = request.FILES.get('image')
+    if upload is None:
+        return _fail('이미지를 첨부해 주세요.')
+    if upload.size > settings.PROFILE_IMAGE_MAX_BYTES:
+        limit = settings.PROFILE_IMAGE_MAX_BYTES // (1024 * 1024)
+        return _fail(f'이미지는 {limit}MB 이하만 올릴 수 있습니다.')
+
+    try:
+        variants = render_variants(upload.read())
+    except ProfileImageError as error:
+        return _fail(str(error))
+
+    keys = save_variants(variants)
+    profile.imageKey = keys['512']
+    profile.imageThumbKey = keys['128']
+    profile.imageUpdatedAt = timezone.now()
+    profile.save(update_fields=['imageKey', 'imageThumbKey', 'imageUpdatedAt',
+                                'lastLoginAt'])
+
+    # 새 이미지가 확정된 뒤에 지운다. 반대로 하면 저장에 실패했을 때 이전 사진까지
+    # 사라진다.
+    delete_objects(previous)
+
+    return Response({'s': True, 'profile': _profile(profile, request)})
+
+
+def _clear_profile_image(profile: Profile) -> None:
+    profile.imageKey = ''
+    profile.imageThumbKey = ''
+    profile.imageUpdatedAt = None
+    profile.save(update_fields=['imageKey', 'imageThumbKey', 'imageUpdatedAt',
+                                'lastLoginAt'])

@@ -4,12 +4,11 @@ import base64
 import binascii
 import logging
 from datetime import timedelta
-from urllib.parse import urlparse
-
 import boto3
 import h3
 from django.core.files.storage import default_storage
 from django.conf import settings
+from config.object_storage import public_object_endpoint
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -575,14 +574,11 @@ def _detail_download_url(request, object_key: str) -> str:
 
 
 def _public_object_endpoint(request) -> str | None:
-    """개발에서는 API 요청 호스트를 그대로 사용해 MinIO 공개 주소를 만든다."""
-    if not settings.DEBUG:
-        return settings.S3_PUBLIC_ENDPOINT_URL
+    """개발에서는 API 요청 호스트를 그대로 사용해 MinIO 공개 주소를 만든다.
 
-    hostname = urlparse(f'//{request.get_host()}').hostname
-    if not hostname:
-        return settings.S3_PUBLIC_ENDPOINT_URL
-    return f'{request.scheme}://{hostname}:9000'
+    프로필 이미지도 같은 규칙이 필요해 `config.object_storage` 로 옮겼다.
+    """
+    return public_object_endpoint(request)
 
 
 @api_view(['GET'])

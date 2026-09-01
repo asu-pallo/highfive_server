@@ -87,7 +87,12 @@ def check_docker() -> None:
 
 def configure_android_minio_reverse() -> None:
     """연결된 Android 개발 단말의 localhost:9000을 로컬 MinIO로 전달한다."""
-    public_endpoint = urlparse(os.getenv('S3_PUBLIC_ENDPOINT_URL', ''))
+    # 공개 주소를 따로 지정하지 않으면 내부 MinIO 주소를 기준으로 판단한다. 이전에는
+    # S3_PUBLIC_ENDPOINT_URL이 비어 있으면 localhost를 쓰면서도 reverse를 건너뛰었다.
+    public_endpoint = urlparse(
+        os.getenv('S3_PUBLIC_ENDPOINT_URL')
+        or os.getenv('S3_ENDPOINT_URL', '')
+    )
     if public_endpoint.hostname not in {'localhost', '127.0.0.1'}:
         return
     try:
@@ -383,12 +388,16 @@ def reset_local_object_storage() -> None:
         compose('up', '-d', 'minio')
         wait_for_minio()
         compose('run', '--rm', 'minio-init')
-        print(f'로컬 MinIO 버킷 파일을 삭제합니다: {bucket}')
+        print(f'로컬 MinIO 버킷 파일을 삭제합니다: {bucket}, highfive-public')
+        # 프로필 이미지는 공개 버킷에 있으므로 함께 비운다. 정책은 각 버킷의 의도대로
+        # 다시 세운다 — private 은 닫고, public 은 읽기만 연다.
         compose(
             'run', '--rm', '--entrypoint', '/bin/sh', 'minio-init', '-c',
             'mc alias set local http://minio:9000 minioadmin minioadmin '
             '&& mc rm --recursive --force local/highfive-private '
-            '&& mc anonymous set none local/highfive-private',
+            '&& mc anonymous set none local/highfive-private '
+            '&& mc rm --recursive --force local/highfive-public '
+            '&& mc anonymous set download local/highfive-public',
         )
     finally:
         if not minio_was_running:
