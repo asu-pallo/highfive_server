@@ -54,10 +54,6 @@ class WorkoutUploadSerializer(serializers.Serializer):
         return attrs
 
 
-class WorkoutUploadPrepareSerializer(WorkoutUploadSerializer):
-    pass
-
-
 class WorkoutSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source='sourceWorkoutId')
     serverId = serializers.IntegerField(source='pk')

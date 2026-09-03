@@ -21,7 +21,7 @@ class _CellVisit:
 
 
 def ensure_h3_segments(workout: Workout, route: list[dict]) -> int:
-    """기존 원본이 동일해도 아직 인덱싱되지 않은 운동은 한 번 생성한다."""
+    """동일 상세의 재업로드에서는 기존 H3를 재사용하고 없을 때만 생성한다."""
     if not route:
         return 0
     index_version = _active_h3_version()
@@ -38,7 +38,11 @@ def rebuild_h3_segments(
     *,
     index_version: SpatialIndexVersion | None = None,
 ) -> int:
-    """원본 경로를 H3 연속 체류 구간으로 바꾸고 해당 운동의 인덱스를 교체한다."""
+    """원본 경로를 H3 연속 체류 구간으로 바꾸고 운동 인덱스를 교체한다.
+
+    좌표 사이에 통과한 셀을 보충하고 이동 시간을 분배한 뒤 TrajectorySegment로
+    일괄 저장한다. 현재 인덱스는 H3 resolution 11을 사용한다.
+    """
     index_version = index_version or _active_h3_version()
     visits = _build_cell_visits(route, workout.endAt)
     visits = [visit for visit in visits if visit.entered_at < visit.exited_at]
@@ -76,6 +80,7 @@ def _active_h3_version() -> SpatialIndexVersion:
 
 
 def _build_cell_visits(route: list[dict], workout_end: datetime) -> list[_CellVisit]:
+    """시간순 원본 좌표를 셀별 진입·이탈 시각이 있는 연속 방문 목록으로 바꾼다."""
     if not route:
         return []
 
@@ -118,6 +123,7 @@ def _build_cell_visits(route: list[dict], workout_end: datetime) -> list[_CellVi
 
 
 def _grid_path(start_cell: str, end_cell: str) -> list[str]:
+    """두 GPS 샘플 사이에서 지나간 H3 셀을 순서대로 보충한다."""
     if start_cell == end_cell:
         return [start_cell]
     try:

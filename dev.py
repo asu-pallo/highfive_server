@@ -1,5 +1,18 @@
 #!/usr/bin/env python
-"""로컬 Docker 서비스와 Django 개발 서버를 함께 관리한다."""
+"""HighFive 서버의 로컬 개발 환경을 한 명령으로 관리한다.
+
+PostgreSQL·MinIO 컨테이너와 공용 Redis의 준비 상태를 확인하고 Django 개발
+서버를 실행한다. 개발 환경의 상태 확인, 로그 조회, DB 접속, 로컬 데이터
+초기화도 이 파일의 하위 명령으로 제공한다.
+
+사용 예시:
+    python dev.py up
+    python dev.py down
+    python dev.py status
+    python dev.py logs
+    python dev.py db
+    python dev.py reset
+"""
 
 from __future__ import annotations
 
@@ -28,10 +41,12 @@ MANAGE_PY = SERVER_DIR / 'manage.py'
 
 
 def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    """서버 디렉터리를 작업 경로로 사용해 외부 명령을 실행한다."""
     return subprocess.run(command, cwd=SERVER_DIR, check=check)
 
 
 def compose(*arguments: str, check: bool = True) -> subprocess.CompletedProcess:
+    """이 프로젝트의 Docker Compose 파일을 대상으로 명령을 실행한다."""
     return run(
         ['docker', 'compose', '-f', str(COMPOSE_FILE), *arguments],
         check=check,
@@ -39,6 +54,7 @@ def compose(*arguments: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def load_environment() -> None:
+    """.env를 읽고 로컬 객체 저장소에 필요한 기본 환경 변수를 채운다."""
     env_file = SERVER_DIR / '.env'
     if not env_file.exists():
         raise SystemExit('.env가 없습니다. cp .env.example .env 를 먼저 실행하세요.')
@@ -49,10 +65,12 @@ def load_environment() -> None:
     os.environ.setdefault('S3_ACCESS_KEY', 'minioadmin')
     os.environ.setdefault('S3_SECRET_KEY', 'minioadmin')
     os.environ.setdefault('S3_BUCKET_NAME', 'highfive-private')
+    os.environ.setdefault('S3_PUBLIC_BUCKET_NAME', 'highfive-public')
     os.environ.setdefault('S3_REGION', 'ap-northeast-2')
 
 
 def check_python_dependencies() -> None:
+    """Django 서버 실행에 필요한 핵심 Python 패키지가 설치됐는지 확인한다."""
     try:
         __import__('django')
         __import__('psycopg')
@@ -66,6 +84,7 @@ def check_python_dependencies() -> None:
 
 
 def check_docker() -> None:
+    """Docker Desktop, Compose 및 프로젝트 Compose 파일을 사용할 수 있는지 확인한다."""
     if not COMPOSE_FILE.exists():
         raise SystemExit(f'Docker Compose 파일이 없습니다: {COMPOSE_FILE}')
     try:
@@ -139,6 +158,7 @@ def configure_android_minio_reverse() -> None:
 
 
 def remove_android_minio_reverse() -> None:
+    """Android 단말에 등록한 localhost:9000 역방향 포트 전달을 해제한다."""
     try:
         subprocess.run(
             ['adb', 'reverse', '--remove', 'tcp:9000'],
@@ -151,6 +171,7 @@ def remove_android_minio_reverse() -> None:
 
 
 def wait_for_minio(timeout_seconds: int = 30) -> None:
+    """MinIO 준비 상태 API가 성공할 때까지 제한 시간 동안 기다린다."""
     endpoint = 'http://localhost:9000/minio/health/ready'
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -169,6 +190,7 @@ def wait_for_minio(timeout_seconds: int = 30) -> None:
 
 
 def wait_for_postgres(timeout_seconds: int = 30) -> None:
+    """Compose의 PostgreSQL이 연결을 받을 수 있을 때까지 기다린다."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         result = compose(
@@ -183,6 +205,7 @@ def wait_for_postgres(timeout_seconds: int = 30) -> None:
 
 
 def wait_for_redis(timeout_seconds: int = 30) -> None:
+    """설정된 공용 Redis가 ping에 응답할 때까지 기다린다."""
     client = Redis.from_url(os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'))
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -199,6 +222,7 @@ def wait_for_redis(timeout_seconds: int = 30) -> None:
 
 
 def stop_django() -> None:
+    """PID 파일에 기록된 Django 개발 서버 프로세스 그룹을 종료한다."""
     if not PID_FILE.exists():
         print('실행 중인 Django 개발 서버가 없습니다.')
         return
@@ -214,6 +238,7 @@ def stop_django() -> None:
 
 
 def up() -> None:
+    """개발 서비스 준비, 마이그레이션 적용 후 Django 서버를 전면 실행한다."""
     load_environment()
     check_python_dependencies()
     check_docker()
@@ -263,6 +288,7 @@ def up() -> None:
 
 
 def down() -> None:
+    """Django 서버, Android 포트 전달 및 Docker 개발 서비스를 종료한다."""
     stop_django()
     remove_android_minio_reverse()
     if subprocess.run(
@@ -276,6 +302,7 @@ def down() -> None:
 
 
 def status() -> None:
+    """Django 프로세스와 Docker Compose 서비스의 현재 상태를 출력한다."""
     if PID_FILE.exists():
         try:
             os.kill(int(PID_FILE.read_text().strip()), 0)
@@ -297,12 +324,14 @@ def status() -> None:
 
 
 def logs() -> None:
+    """Docker Compose 서비스 로그를 최근 100줄부터 실시간으로 출력한다."""
     print('Django 로그는 `python dev.py up`을 실행한 터미널에 표시됩니다.')
     print('Docker 서비스 로그를 표시합니다. 종료하려면 Ctrl+C를 누르세요.')
     compose('logs', '--follow', '--tail', '100', check=False)
 
 
 def database_shell() -> None:
+    """로컬 PostgreSQL을 준비하고 프로젝트 DB의 psql 셸을 연다."""
     load_environment()
     check_docker()
     compose('up', '-d', 'postgres')
@@ -362,6 +391,7 @@ def reset() -> None:
 
 
 def reset_local_object_storage() -> None:
+    """로컬 MinIO의 비공개·공개 버킷을 비우고 접근 정책을 다시 설정한다."""
     endpoint = urlparse(os.environ['S3_ENDPOINT_URL'])
     bucket = os.environ['S3_BUCKET_NAME']
     if endpoint.hostname not in {'localhost', '127.0.0.1'} or bucket != 'highfive-private':
@@ -405,6 +435,7 @@ def reset_local_object_storage() -> None:
 
 
 def main() -> None:
+    """명령행 인자를 해석해 요청한 개발 환경 작업을 실행한다."""
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest='command', required=True)
     for command in ('up', 'down', 'status', 'logs', 'db'):
